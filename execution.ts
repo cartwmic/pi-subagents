@@ -231,8 +231,7 @@ async function runSingleAttempt(
 				const termSent = trySignalChild(proc, "SIGTERM");
 				if (!termSent) return;
 				forcedTerminationSignal = true;
-				result.error = result.error
-					?? `Subagent process did not exit within ${FINAL_DRAIN_MS}ms after its final message. Forcing termination.`;
+				appendRecentOutput(progress, [`[warn] Subagent process did not exit within ${FINAL_DRAIN_MS}ms after its final message. Forcing termination.`]);
 				finalHardKillTimer = setTimeout(() => {
 					if (settled || processClosed || detached) return;
 					forcedTerminationSignal = trySignalChild(proc, "SIGKILL") || forcedTerminationSignal;
@@ -449,7 +448,7 @@ async function runSingleAttempt(
 			if (code !== 0 && stderrBuf.trim() && !result.error) {
 				result.error = stderrBuf.trim();
 			}
-			const finalCode = forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
+			const finalCode = (!forcedTerminationSignal && signal) ? (code ?? 1) : (code ?? 0);
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {
