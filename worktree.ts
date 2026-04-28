@@ -100,17 +100,8 @@ function runGitChecked(cwd: string, args: string[]): string {
 }
 
 function resolveRepoState(cwd: string): RepoState {
-	const repoCheck = runGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
-	if (repoCheck.status !== 0 || repoCheck.stdout.trim() !== "true") {
-		throw new Error("worktree isolation requires a git repository");
-	}
-
+	const cwdRelative = resolveRepoCwdRelative(cwd);
 	const toplevel = runGitChecked(cwd, ["rev-parse", "--show-toplevel"]).trim();
-	const rawPrefix = runGitChecked(cwd, ["rev-parse", "--show-prefix"]).trim();
-	const normalizedPrefix = rawPrefix
-		? path.normalize(rawPrefix.replace(/[\\/]+$/, ""))
-		: "";
-	const cwdRelative = normalizedPrefix === "." ? "" : normalizedPrefix;
 
 	const status = runGitChecked(toplevel, ["status", "--porcelain"]);
 	if (status.trim().length > 0) {
@@ -163,6 +154,24 @@ function buildWorktreeBranch(runId: string, index: number): string {
 
 function buildWorktreePath(runId: string, index: number): string {
 	return path.join(os.tmpdir(), `pi-worktree-${runId}-${index}`);
+}
+
+function resolveRepoCwdRelative(cwd: string): string {
+	const repoCheck = runGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
+	if (repoCheck.status !== 0 || repoCheck.stdout.trim() !== "true") {
+		throw new Error("worktree isolation requires a git repository");
+	}
+	const rawPrefix = runGitChecked(cwd, ["rev-parse", "--show-prefix"]).trim();
+	const normalizedPrefix = rawPrefix
+		? path.normalize(rawPrefix.replace(/[\\/]+$/, ""))
+		: "";
+	return normalizedPrefix === "." ? "" : normalizedPrefix;
+}
+
+export function resolveExpectedWorktreeAgentCwd(cwd: string, runId: string, index: number): string {
+	const cwdRelative = resolveRepoCwdRelative(cwd);
+	const worktreePath = buildWorktreePath(runId, index);
+	return cwdRelative ? path.join(worktreePath, cwdRelative) : worktreePath;
 }
 
 function linkNodeModulesIfPresent(toplevel: string, worktreePath: string): boolean {

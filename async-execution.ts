@@ -12,12 +12,13 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AgentConfig } from "./agents.ts";
 import { applyThinkingSuffix } from "./pi-args.ts";
 import { injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.ts";
-import { isParallelStep, resolveStepBehavior, type ChainStep, type SequentialStep, type StepOverrides } from "./settings.ts";
+import { buildChainInstructions, isParallelStep, resolveStepBehavior, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "./settings.ts";
 import type { RunnerStep } from "./parallel-utils.ts";
 import { resolvePiPackageRoot } from "./pi-spawn.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "./skills.ts";
 import { resolveChildCwd } from "./utils.ts";
 import { buildModelCandidates, resolveModelCandidate, type AvailableModelInfo } from "./model-fallback.ts";
+import { resolveExpectedWorktreeAgentCwd } from "./worktree.ts";
 import {
 	type ArtifactConfig,
 	type Details,
@@ -63,6 +64,7 @@ export interface AsyncExecutionContext {
 
 export interface AsyncChainParams {
 	chain: ChainStep[];
+	resultMode?: "parallel" | "chain";
 	agents: AgentConfig[];
 	ctx: AsyncExecutionContext;
 	availableModels?: AvailableModelInfo[];
@@ -221,12 +223,22 @@ export function executeAsyncChain(
 		};
 	}
 
-	const buildSeqStep = (s: SequentialStep, sessionFile?: string) => {
+	let progressInstructionCreated = false;
+	const buildStepOverrides = (s: SequentialStep): StepOverrides => {
+		const stepSkillInput = normalizeSkillInput(s.skill);
+		return {
+			...(s.output !== undefined ? { output: s.output } : {}),
+			...(s.reads !== undefined ? { reads: s.reads } : {}),
+			...(s.progress !== undefined ? { progress: s.progress } : {}),
+			...(stepSkillInput !== undefined ? { skills: stepSkillInput } : {}),
+			...(s.model ? { model: s.model } : {}),
+		};
+	};
+	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior) => {
 		const a = agents.find((x) => x.name === s.agent)!;
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
-		const stepSkillInput = normalizeSkillInput(s.skill);
-		const stepOverrides: StepOverrides = { skills: stepSkillInput };
-		const behavior = resolveStepBehavior(a, stepOverrides, chainSkills);
+		const instructionCwd = behaviorCwd ?? stepCwd;
+		const behavior = resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills);
 		const skillNames = behavior.skills === false ? [] : behavior.skills;
 		const { resolved: resolvedSkills } = resolveSkillsWithFallback(skillNames, stepCwd, ctx.cwd);
 
@@ -236,16 +248,20 @@ export function executeAsyncChain(
 			systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
 		}
 
-		const outputPath = resolveSingleOutputPath(s.output, ctx.cwd, stepCwd);
-		const task = injectSingleOutputInstruction(s.task ?? "{previous}", outputPath);
+		const readInstructions = buildChainInstructions({ ...behavior, output: false, progress: false }, instructionCwd, false);
+		const isFirstProgressAgent = behavior.progress && !progressPrecreated && !progressInstructionCreated;
+		if (behavior.progress) progressInstructionCreated = true;
+		const progressInstructions = buildChainInstructions({ ...behavior, output: false, reads: false }, runnerCwd, isFirstProgressAgent);
+		const outputPath = resolveSingleOutputPath(behavior.output, ctx.cwd, instructionCwd);
+		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${s.task ?? "{previous}"}${progressInstructions.suffix}`, outputPath);
 
-		const primaryModel = resolveModelCandidate(s.model ?? a.model, availableModels, ctx.currentModelProvider);
+		const primaryModel = resolveModelCandidate(behavior.model ?? a.model, availableModels, ctx.currentModelProvider);
 		return {
 			agent: s.agent,
 			task,
 			cwd: stepCwd,
 			model: applyThinkingSuffix(primaryModel, a.thinking),
-			modelCandidates: buildModelCandidates(s.model ?? a.model, a.fallbackModels, availableModels, ctx.currentModelProvider).map((candidate) =>
+			modelCandidates: buildModelCandidates(behavior.model ?? a.model, a.fallbackModels, availableModels, ctx.currentModelProvider).map((candidate) =>
 				applyThinkingSuffix(candidate, a.thinking),
 			),
 			tools: a.tools,
@@ -269,17 +285,29 @@ export function executeAsyncChain(
 		return sessionFile;
 	};
 
-	const steps: RunnerStep[] = chain.map((s) => {
+	const steps: RunnerStep[] = chain.map((s, stepIndex) => {
 		if (isParallelStep(s)) {
+			const parallelBehaviors = s.parallel.map((task) => {
+				const agent = agents.find((candidate) => candidate.name === task.agent)!;
+				return resolveStepBehavior(agent, buildStepOverrides(task), chainSkills);
+			});
+			const progressPrecreated = parallelBehaviors.some((behavior) => behavior.progress);
+			if (progressPrecreated) {
+				if (!s.worktree) writeInitialProgressFile(runnerCwd);
+				progressInstructionCreated = true;
+			}
 			return {
-				parallel: s.parallel.map((t) => buildSeqStep({
-					agent: t.agent,
-					task: t.task,
-					cwd: t.cwd,
-					skill: t.skill,
-					model: t.model,
-					output: t.output,
-				}, nextSessionFile())),
+				parallel: s.parallel.map((t, taskIndex) => {
+					let behaviorCwd: string | undefined;
+					if (s.worktree) {
+						try {
+							behaviorCwd = resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s${stepIndex}`, taskIndex);
+						} catch {
+							behaviorCwd = undefined;
+						}
+					}
+					return buildSeqStep(t, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex]);
+				}),
 				concurrency: s.concurrency,
 				failFast: s.failFast,
 				worktree: s.worktree,
@@ -318,6 +346,7 @@ export function executeAsyncChain(
 				controlConfig,
 				controlIntercomTarget,
 				childIntercomTargets,
+				resultMode: params.resultMode ?? "chain",
 			},
 			id,
 			runnerCwd,
@@ -457,6 +486,7 @@ export function executeAsyncSingle(
 				controlConfig,
 				controlIntercomTarget,
 				childIntercomTargets: childIntercomTarget ? [childIntercomTarget(agent, 0)] : undefined,
+				resultMode: "single",
 			},
 			id,
 			runnerCwd,

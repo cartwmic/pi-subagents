@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-04-27
+
+### Fixed
+- Made the packaged `/parallel-cleanup` prompt self-contained instead of referencing local-only cleanup skills.
+
+## [0.20.0] - 2026-04-27
+
+### Added
+- Added a packaged `/parallel-cleanup` prompt for focused cleanup review passes.
+
+### Changed
+- Consolidated the `oracle-executor` role into `worker`: `worker` now uses `openai-codex/gpt-5.3-codex` with high thinking and stricter approved-direction guardrails, while `researcher` and `context-builder` now use medium thinking.
+- Updated the bundled `scout` agent model/thinking defaults.
+- Hard-cut over grouped intercom bridge result delivery: with the bridge active, parent-side `pi-subagents` emits one grouped `subagent:result-intercom` message per foreground parent run (single, top-level parallel, or chain) and one per completed async result file. Acknowledged foreground delivery returns a compact receipt instead of duplicating full output in the normal tool result; unacknowledged delivery preserves the normal full output. Grouped messages include child intercom targets and full child summaries.
+
+### Fixed
+- Fixed status and manager row rendering so multiline or tabbed content cannot overflow table rows.
+
+### Removed
+- Removed the bundled `oracle-executor` agent and `/oracle-executor` prompt template in favor of using `worker` for approved oracle handoffs.
+
+## [0.19.3] - 2026-04-27
+
+### Changed
+- Updated the packaged `/parallel-review` prompt so reviewer angles are generated dynamically from the user's intent, plan, implemented code, and current diff, with the listed angles framed as examples rather than fixed defaults.
+
+## [0.19.2] - 2026-04-27
+
+### Added
+- Added packaged prompt templates for common subagent workflows: `/parallel-research`, `/gather-context-and-clarify`, and `/oracle-executor`.
+
+### Changed
+- Tightened the packaged `/parallel-review` prompt so fresh-context reviewers get distinct angles and return evidence-backed findings.
+- Refreshed the packaged `pi-subagents` skill with doctor diagnostics, saved-chain launches, prompt shortcuts, builtin overrides, intercom bridge guidance, fresh-context review defaults, and parallel task behavior.
+- Reworked the README around plain-language usage, good first prompts, packaged prompt shortcuts, builtin agent guidance, intercom setup, model overrides, and optional reference material.
+
+## [0.19.1] - 2026-04-26
+
+### Added
+- Added `subagent({ action: "doctor" })` and `/subagents-doctor` for read-only subagent environment diagnostics.
+- Added `/run-chain` to launch saved `.chain.md` workflows directly from slash commands with completion, shared task input, and `--bg`/`--fork` support.
+
+## [0.19.0] - 2026-04-26
+
+### Added
+- Added top-level parallel task support for per-task `output`, `reads`, and `progress`, including `/parallel` inline forwarding and async preservation.
+- Added `/agents` launch toggles for forked context, background execution, and worktree-isolated parallel runs.
+- Added a read-only detail view to `/subagents-status` for inspecting selected async runs, including recent events, output tails, and useful run paths.
+- Added a packaged `/parallel-review` prompt template for launching fresh-context adversarial review subagents.
+
+### Fixed
+- Parallel and chain child runs now detach cleanly when a child uses intercom, preventing incoming handoff messages from aborting the parent foreground run.
+
 ## [0.18.1] - 2026-04-25
 
 ### Changed

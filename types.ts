@@ -69,6 +69,37 @@ export interface ControlEvent {
 	message: string;
 }
 
+export type SubagentResultStatus = "completed" | "failed" | "paused" | "detached";
+
+export interface SubagentResultIntercomChild {
+	agent: string;
+	status: SubagentResultStatus;
+	summary: string;
+	index?: number;
+	artifactPath?: string;
+	sessionPath?: string;
+	intercomTarget?: string;
+}
+
+export interface SubagentResultIntercomPayload {
+	to: string;
+	message: string;
+	requestId?: string;
+	runId: string;
+	mode: "single" | "parallel" | "chain";
+	status: SubagentResultStatus;
+	summary: string;
+	source: "foreground" | "async";
+	children: SubagentResultIntercomChild[];
+	asyncId?: string;
+	asyncDir?: string;
+	chainSteps?: number;
+	agent?: string;
+	index?: number;
+	artifactPath?: string;
+	sessionPath?: string;
+}
+
 // ============================================================================
 // Progress Tracking
 // ============================================================================
@@ -310,6 +341,8 @@ export const SUBAGENT_ASYNC_STARTED_EVENT = "subagent:async-started";
 export const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 export const SUBAGENT_CONTROL_EVENT = "subagent:control-event";
 export const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
+export const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
+export const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
 
 // ============================================================================
 // Execution Options

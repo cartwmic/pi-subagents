@@ -8,6 +8,7 @@ import type { AgentConfig } from "./agents.ts";
 import { normalizeSkillInput } from "./skills.ts";
 import { CHAIN_RUNS_DIR } from "./types.ts";
 const CHAIN_DIR_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+const INITIAL_PROGRESS_CONTENT = "# Progress\n\n## Status\nIn Progress\n\n## Tasks\n\n## Files Changed\n\n## Notes\n";
 
 // =============================================================================
 // Behavior Resolution Types
@@ -224,6 +225,10 @@ function resolveChainPath(filePath: string, chainDir: string): string {
  * Build chain instructions from resolved behavior.
  * These are appended to the task to tell the agent what to read/write.
  */
+export function writeInitialProgressFile(progressDir: string): void {
+	fs.writeFileSync(path.join(progressDir, "progress.md"), INITIAL_PROGRESS_CONTENT);
+}
+
 export function buildChainInstructions(
 	behavior: ResolvedStepBehavior,
 	chainDir: string,

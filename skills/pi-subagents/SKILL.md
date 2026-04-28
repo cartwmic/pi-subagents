@@ -15,8 +15,8 @@ agents into a workflow, or create/edit agents and chains on demand.
 
 ## When to Use
 
-- **Advisory review**: fork to `oracle` or `reviewer` for a branched review thread
-- **Implementation handoff**: have `oracle` advise, then `oracle-executor` or `worker` implement
+- **Advisory review**: use fresh-context `reviewer` agents for adversarial code review, or fork to `oracle` when inherited decisions and drift matter
+- **Implementation handoff**: have `oracle` advise, then `worker` implement only after an approved direction
 - **Recon and planning**: use `scout` or `context-builder`, then `planner`
 - **Parallel exploration**: run multiple non-conflicting tasks concurrently
 - **Long-running work**: launch async/background runs and inspect them later
@@ -32,10 +32,17 @@ Humans often use the slash-command layer instead:
 - `/chain` — launch a chain of steps
 - `/parallel` — launch top-level parallel tasks
 - `/agents` — open the agents manager TUI
+- `/run-chain` — launch a saved `.chain.md` workflow
 - `/subagents-status` — inspect active/recent async runs
+- `/subagents-doctor` — diagnose setup, discovery, async paths, and intercom bridge state
 
 Prefer the tool when you are writing agent logic. Prefer the slash commands when
 you are guiding a human through an interactive flow.
+
+Packaged prompt shortcuts are also available for repeatable workflows:
+- `/parallel-review` — fresh-context reviewers with distinct review angles, then synthesis
+- `/parallel-research` — combine `researcher` and `scout` for external evidence plus local code context
+- `/gather-context-and-clarify` — scout/research first, then ask the user clarifying questions with `interview`
 
 ## Builtin Agents
 
@@ -46,24 +53,47 @@ and user/project agents override builtins with the same name.
 |-------|---------|-------|------------------------|
 | `scout` | Fast codebase recon | `openai-codex/gpt-5.4-mini` | Writes `context.md` handoff material |
 | `planner` | Creates implementation plans | `openai-codex/gpt-5.5` | Writes `plan.md` |
-| `worker` | General implementation | `openai-codex/gpt-5.5` | Edits code directly |
+| `worker` | Implementation and approved oracle handoffs | `openai-codex/gpt-5.3-codex` | Single-writer implementation with decision escalation |
 | `reviewer` | Review-and-fix specialist | `openai-codex/gpt-5.5` | Can edit/fix reviewed code |
 | `context-builder` | Requirements/codebase handoff builder | `openai-codex/gpt-5.5` | Writes structured context files |
 | `researcher` | Web research brief generator | `openai-codex/gpt-5.5` | Writes `research.md` |
 | `delegate` | Lightweight generic delegate | inherits parent model | No fixed output; generic delegated work |
 | `oracle` | Decision-consistency advisory review | `openai-codex/gpt-5.5` | Advisory review, intercom coordination |
-| `oracle-executor` | Implementation after approval | `openai-codex/gpt-5.5` | Single-writer implementation after approval |
 
-Override builtin defaults via settings before copying full agent files when a
-small tweak is enough.
+Override builtin defaults before copying full agent files when a small tweak is enough.
+
+For one run, use inline config:
+
+```text
+/run reviewer[model=anthropic/claude-sonnet-4] "Review this diff"
+```
+
+For persistent tweaks, prefer `/agents`: choose the builtin, press `e`, change the model or other fields, then save a user or project override. User overrides apply everywhere. Project overrides apply only in that repo and win over user overrides.
 
 Settings locations:
 - User scope: `~/.pi/agent/settings.json`
 - Project scope: `.pi/settings.json`
 
+Direct settings example:
+
+```json
+{
+  "subagents": {
+    "agentOverrides": {
+      "reviewer": {
+        "model": "anthropic/claude-sonnet-4",
+        "thinking": "high",
+        "fallbackModels": ["openai/gpt-5-mini"]
+      }
+    }
+  }
+}
+```
+
 Useful override fields: `model`, `fallbackModels`, `thinking`,
 `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `disabled`,
-`skills`, `tools`, and `systemPrompt`.
+`skills`, `tools`, and `systemPrompt`. Create a user or project agent with the
+same name only when you want a substantially different agent.
 
 ## Discovery and Scope Rules
 
@@ -119,6 +149,21 @@ subagent({
 })
 ```
 
+Top-level parallel tasks can override per-task behavior:
+
+```typescript
+subagent({
+  tasks: [
+    { agent: "scout", task: "Map auth", output: "auth-context.md", progress: true },
+    { agent: "researcher", task: "Research OAuth best practices", output: "oauth-research.md" },
+    { agent: "reviewer", task: "Review auth tests", model: "anthropic/claude-sonnet-4" }
+  ],
+  concurrency: 3
+})
+```
+
+Avoid duplicate output paths in parallel tasks. Concurrent children should not write to the same file.
+
 ### Chain execution
 
 ```typescript
@@ -146,6 +191,14 @@ subagent({
 ```
 
 Inspect async runs with `subagent({ action: "status", id: "..." })`, `subagent({ action: "status" })` for active runs, or the `/subagents-status` slash command.
+
+Use diagnostics when setup or child startup looks wrong:
+
+```typescript
+subagent({ action: "doctor" })
+```
+
+Humans can use `/subagents-doctor` for the same read-only report. It checks runtime paths, discovery counts, async support, current session context, and intercom bridge state.
 
 ### Subagent control
 
@@ -198,6 +251,8 @@ subagent({
 Chains default to clarify mode unless you explicitly set `clarify: false`.
 For programmatic background launches, use `clarify: false, async: true`.
 
+The `/agents` manager also has launch toggles for forked context, background execution, and worktree-isolated parallel runs. Use it when guiding a human who wants to inspect or edit the launch before starting.
+
 ## Worktree Isolation
 
 When multiple agents might write concurrently, use worktrees instead of letting
@@ -225,7 +280,7 @@ The intended oracle loop is:
 2. `oracle` reviews direction, drift, assumptions, and risks
 3. `oracle` can coordinate back to the orchestrator via `intercom`
 4. the main agent decides what direction to approve
-5. only then should `oracle-executor` implement
+5. only then should `worker` implement
 
 ```typescript
 // Advisory review in a branched thread
@@ -237,7 +292,7 @@ subagent({
 
 // Implementation only after explicit approval
 subagent({
-  agent: "oracle-executor",
+  agent: "worker",
   task: "Implement the approved approach: ...",
   context: "fork"
 })
@@ -249,35 +304,44 @@ history as a baseline contract.
 
 ## Subagent + Intercom Coordination
 
-When `pi-intercom` is installed and enabled, delegated runs can coordinate with
-the orchestrator through the intercom bridge.
+`pi-subagents` works without `pi-intercom`. When `pi-intercom` is installed and enabled, the intercom bridge can automatically give child agents a private coordination channel back to the parent session.
 
-### Subagent asks the orchestrator
+Most agents should not call `intercom` directly unless bridge instructions provide a target. Do not invent a target. Use the target from the injected bridge instructions or from a visible needs-attention notice.
+
+Use `intercom` when:
+- a subagent is blocked on a decision
+- a child needs clarification instead of guessing
+- a detached or async child needs to coordinate without waiting for normal tool return flow
+- an advisory agent was explicitly asked to send a concise progress update
+
+Message conventions:
+- `ask` means the child needs a decision or clarification from the parent session.
+- `send` means a short blocked/progress update, only when blocked or explicitly asked.
+- Child-side routine completion handoffs are not expected. With the intercom bridge active, parent-side `pi-subagents` sends grouped completion results through `pi-intercom`: one grouped message per foreground parent run and one per completed async result file. Acknowledged foreground delivery returns a compact receipt with artifact/session paths; if unacknowledged, the normal full output is preserved. Grouped messages include child intercom targets and full child summaries.
+
+If a bridge target is available, a child can ask:
 
 ```typescript
 intercom({
   action: "ask",
-  to: "orchestrator",
+  to: "<bridge-provided-target>",
   message: "Should I optimize for readability or performance here?"
 })
 ```
 
-### Orchestrator replies
+The parent replies with:
 
 ```typescript
 intercom({ action: "reply", message: "Optimize for readability." })
 ```
 
-Or inspect unresolved asks first:
+Or inspects unresolved asks first:
 
 ```typescript
 intercom({ action: "pending" })
 ```
 
-Use `intercom` when:
-- a subagent is blocked on a decision
-- an advisory agent wants to send a concise handoff mid-flight
-- a detached or async child needs to coordinate without waiting for normal tool return flow
+If intercom messages do not show up, run `subagent({ action: "doctor" })` or `/subagents-doctor`.
 
 ## Management Mode
 
@@ -326,6 +390,8 @@ subagent({ action: "delete", agent: "my-agent" })
 Use management actions when the system needs to create or edit subagents on
 demand without dropping into raw file editing.
 
+Management actions create or update user/project agent files. For small builtin changes such as a model swap, prefer `/agents` builtin overrides or `subagents.agentOverrides` in settings.
+
 ## Creating and Editing Agents by File
 
 A minimal agent file looks like this:
@@ -357,7 +423,11 @@ copying a full builtin file.
 
 ## Prompt Template Integration
 
-If `pi-prompt-template-model` is installed, prompt templates can delegate into
+The package includes prompt shortcuts for common workflows: `/parallel-review`,
+`/parallel-research`, and `/gather-context-and-clarify`. Use them when the user
+wants repeatable review, research, or clarification patterns.
+
+If `pi-prompt-template-model` is installed, additional user prompt templates can delegate into
 `pi-subagents`. This is useful when a slash command should always run through a
 particular agent or with forked context.
 
@@ -366,7 +436,7 @@ particular agent or with forked context.
 - **Forking requires a persisted parent session.** If the current session does not
   have a persisted session file, forked runs fail.
 - **Forked runs inherit parent history.** They are branched threads, not fresh
-  filtered contexts.
+  filtered contexts. Use fresh context for adversarial reviewers unless the user explicitly asks for forked context.
 - **Default subagent nesting depth is 2.** Deeper recursive delegation is blocked
   unless configured otherwise.
 - **Attention signals are not lifecycle state.** `needs_attention` means no activity has been observed past the configured threshold. `paused` means the child turn was intentionally interrupted or is awaiting direction; it is not the same as `failed`.
@@ -380,13 +450,15 @@ particular agent or with forked context.
 ### Keep writes single-threaded by default
 
 A strong pattern is one main decision-maker plus advisory/research/review
-subagents around it. Use `oracle` for advice and `oracle-executor` or `worker`
-for the actual write path.
+subagents around it. Use `oracle` for advice and `worker` for the actual write path.
 
 ### Use fork for branched advisory or execution threads
 
 Forked runs are useful when the child should reason in a separate thread while
-still inheriting the parent’s accumulated context.
+still inheriting the parent’s accumulated context. They are especially useful for
+`oracle`, which audits inherited decisions and drift. For adversarial code review,
+prefer fresh-context reviewers that inspect the repo and diff directly unless the
+user explicitly requests forked context.
 
 ### Prefer narrow tasks
 
@@ -426,8 +498,7 @@ subagent({
 subagent({ agent: "worker", task: "Add retry logic to the API client." })
 subagent({
   agent: "reviewer",
-  task: "Review the retry logic implementation. Look for edge cases and race conditions.",
-  context: "fork"
+  task: "Review the retry logic implementation. Inspect the repo and current diff directly. Look for edge cases and race conditions."
 })
 ```
 
@@ -442,12 +513,26 @@ subagent({
 })
 ```
 
+### Saved chain
+
+```text
+/run-chain review-chain -- review this branch
+```
+
+Use saved `.chain.md` workflows when the user wants a repeatable multi-agent flow without rewriting the chain each time.
+
 ## Error Handling
 
 **"Unknown agent"**
 ```typescript
 subagent({ action: "list" })
 // Check available agents and chains, then confirm scope/precedence.
+```
+
+**Setup, discovery, or intercom confusion**
+```typescript
+subagent({ action: "doctor" })
+// Check runtime paths, async support, discovery counts, current session, and intercom bridge state.
 ```
 
 **"Max subagent depth exceeded"**
@@ -463,4 +548,19 @@ subagent({ action: "list" })
 **Intercom "Already waiting for a reply"**
 ```typescript
 // Resolve the current outbound ask before starting another one.
+```
+
+**Parallel output-path conflict**
+```typescript
+// Give each parallel task a distinct output path, or disable output for tasks that do not need it.
+```
+
+**Worktree launch fails**
+```typescript
+// Ensure the git working tree is clean and task cwd overrides match the shared cwd.
+```
+
+**Child fails before starting**
+```typescript
+// Inspect /subagents-status detail, artifact metadata/output logs, and run doctor. Extension loader errors usually appear in child output logs.
 ```

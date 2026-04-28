@@ -51,6 +51,7 @@ import {
 	formatWorktreeTaskCwdConflict,
 	type WorktreeSetup,
 } from "./worktree.ts";
+import { writeInitialProgressFile } from "./settings.ts";
 
 interface SubagentRunConfig {
 	id: string;
@@ -74,6 +75,7 @@ interface SubagentRunConfig {
 	controlConfig?: ResolvedControlConfig;
 	controlIntercomTarget?: string;
 	childIntercomTargets?: Array<string | undefined>;
+	resultMode?: "single" | "parallel" | "chain";
 }
 
 interface StepResult {
@@ -81,6 +83,7 @@ interface StepResult {
 	output: string;
 	success: boolean;
 	skipped?: boolean;
+	intercomTarget?: string;
 	model?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
@@ -539,6 +542,7 @@ async function runSingleStep(
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
 	interrupted?: boolean;
+	intercomTarget?: string;
 }> {
 	const placeholderRegex = new RegExp(ctx.placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
 	const task = step.task.replace(placeholderRegex, () => ctx.previousOutput);
@@ -668,6 +672,7 @@ async function runSingleStep(
 		output: outputForSummary,
 		exitCode: finalResult?.exitCode ?? 1,
 		error: finalResult?.error,
+		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 		modelAttempts,
@@ -813,6 +818,12 @@ function appendParallelWorktreeSummary(
 	const diffSummary = formatWorktreeDiffSummary(diffs);
 	if (!diffSummary) return previousOutput;
 	return `${previousOutput}\n\n${diffSummary}`;
+}
+
+function ensureParallelProgressFile(cwd: string, group: Extract<RunnerStep, { parallel: SubagentStep[] }>): void {
+	const progressPath = path.join(cwd, "progress.md");
+	if (!group.parallel.some((task) => task.task.includes(`Update progress at: ${progressPath}`))) return;
+	writeInitialProgressFile(cwd);
 }
 
 async function runSubagent(config: SubagentRunConfig): Promise<void> {
@@ -1037,6 +1048,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 
 			try {
+				if (group.worktree) ensureParallelProgressFile(cwd, group);
 				const groupStartTime = Date.now();
 				markParallelGroupRunning({
 					statusPayload,
@@ -1137,6 +1149,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						output: pr.output,
 						success: pr.exitCode === 0,
 						skipped: pr.skipped,
+						intercomTarget: pr.intercomTarget,
 						model: pr.model,
 						attemptedModels: pr.attemptedModels,
 						modelAttempts: pr.modelAttempts,
@@ -1215,6 +1228,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				agent: singleResult.agent,
 				output: singleResult.output,
 				success: singleResult.exitCode === 0,
+				intercomTarget: singleResult.intercomTarget,
 				model: singleResult.model,
 				attemptedModels: singleResult.attemptedModels,
 				modelAttempts: singleResult.modelAttempts,
@@ -1376,6 +1390,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		writeJson(resultPath, {
 			id,
 			agent: agentName,
+			mode: config.resultMode ?? statusPayload.mode,
 			success: !interrupted && results.every((r) => r.success),
 			state: interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed",
 			summary: interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
@@ -1384,6 +1399,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				output: r.output,
 				success: r.success,
 				skipped: r.skipped || undefined,
+				intercomTarget: r.intercomTarget,
 				model: r.model,
 				attemptedModels: r.attemptedModels,
 				modelAttempts: r.modelAttempts,
@@ -1399,6 +1415,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			asyncDir,
 			sessionId: config.sessionId,
 			sessionFile: effectiveSessionFile,
+			intercomTarget: config.controlIntercomTarget,
 			shareUrl,
 			gistUrl,
 			shareError,

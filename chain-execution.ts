@@ -15,6 +15,7 @@ import {
 	resolveStepBehavior,
 	resolveParallelBehaviors,
 	buildChainInstructions,
+	writeInitialProgressFile,
 	createParallelDirs,
 	aggregateParallelOutputs,
 	isParallelStep,
@@ -26,6 +27,7 @@ import {
 	type ResolvedTemplates,
 } from "./settings.ts";
 import { discoverAvailableSkills, normalizeSkillInput } from "./skills.ts";
+import { INTERCOM_BRIDGE_MARKER } from "./intercom-bridge.ts";
 import { runSync } from "./execution.ts";
 import { buildChainSummary } from "./formatters.ts";
 import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, resolveChildCwd } from "./utils.ts";
@@ -46,6 +48,7 @@ import {
 	type ArtifactPaths,
 	type ControlEvent,
 	type Details,
+	type IntercomEventBus,
 	type ResolvedControlConfig,
 	type SingleResult,
 	MAX_CONCURRENCY,
@@ -75,6 +78,7 @@ interface ParallelChainRunInput {
 	prev: string;
 	originalTask: string;
 	ctx: ExtensionContext;
+	intercomEvents?: IntercomEventBus;
 	cwd?: string;
 	runId: string;
 	globalTaskIndex: number;
@@ -134,8 +138,7 @@ function ensureParallelProgressFile(
 	if (progressCreated || !parallelBehaviors.some((behavior) => behavior.progress)) {
 		return progressCreated;
 	}
-	const progressPath = path.join(chainDir, "progress.md");
-	fs.writeFileSync(progressPath, "# Progress\n\n## Status\nIn Progress\n\n## Tasks\n\n## Files Changed\n\n## Notes\n");
+	writeInitialProgressFile(chainDir);
 	return true;
 }
 
@@ -221,6 +224,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				cwd: taskCwd,
 				signal: input.signal,
 				interruptSignal: interruptController.signal,
+				allowIntercomDetach: taskAgentConfig?.systemPrompt?.includes(INTERCOM_BRIDGE_MARKER) === true,
+				intercomEvents: input.intercomEvents,
 				runId: input.runId,
 				index: input.globalTaskIndex + taskIndex,
 				sessionDir: input.sessionDirForIndex(input.globalTaskIndex + taskIndex),
@@ -287,6 +292,7 @@ export interface ChainExecutionParams {
 	task?: string;
 	agents: AgentConfig[];
 	ctx: ExtensionContext;
+	intercomEvents?: IntercomEventBus;
 	signal?: AbortSignal;
 	runId: string;
 	cwd?: string;
@@ -352,6 +358,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		controlConfig,
 		childIntercomTarget,
 		foregroundControl,
+		intercomEvents,
 		chainSkills: chainSkillsParam,
 		chainDir: chainDirBase,
 	} = params;
@@ -536,6 +543,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					prev,
 					originalTask,
 					ctx,
+					intercomEvents,
 					cwd,
 					runId,
 					globalTaskIndex,
@@ -709,6 +717,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				cwd: resolveChildCwd(cwd ?? ctx.cwd, seqStep.cwd),
 				signal,
 				interruptSignal: interruptController.signal,
+				allowIntercomDetach: agentConfig.systemPrompt?.includes(INTERCOM_BRIDGE_MARKER) === true,
+				intercomEvents,
 				runId,
 				index: globalTaskIndex,
 				sessionDir: sessionDirForIndex(globalTaskIndex),

@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import type { AgentConfig } from "../../agents.ts";
 import {
 	applyIntercomBridgeToAgent,
+	diagnoseIntercomBridge,
 	resolveIntercomBridge,
 	resolveIntercomSessionTarget,
 	resolveSubagentIntercomTarget,
@@ -53,7 +54,72 @@ describe("resolveIntercomSessionTarget", () => {
 describe("resolveSubagentIntercomTarget", () => {
 	it("builds stable child session targets from run metadata", () => {
 		assert.equal(resolveSubagentIntercomTarget("78f659a3", "worker"), "subagent-worker-78f659a3");
-		assert.equal(resolveSubagentIntercomTarget("78f659a3", "oracle executor", 1), "subagent-oracle-executor-78f659a3-2");
+		assert.equal(resolveSubagentIntercomTarget("78f659a3", "senior executor", 1), "subagent-senior-executor-78f659a3-2");
+	});
+});
+
+function withMalformedIntercomConfig<T>(fn: (paths: { extensionDir: string; configPath: string }) => T): T {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-diagnostic-test-"));
+	const extensionDir = path.join(tempDir, "pi-intercom");
+	const configPath = path.join(tempDir, "config.json");
+	fs.mkdirSync(extensionDir, { recursive: true });
+	fs.writeFileSync(configPath, "{ enabled: nope }");
+	try {
+		return fn({ extensionDir, configPath });
+	} finally {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+}
+
+describe("diagnoseIntercomBridge", () => {
+	it("reports inactive and unavailable when pi-intercom is missing", () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-diagnostic-test-"));
+		try {
+			const diagnostic = diagnoseIntercomBridge({
+				config: { mode: "always" },
+				context: "fresh",
+				orchestratorTarget: "main",
+				extensionDir: path.join(tempDir, "missing-pi-intercom"),
+				configPath: path.join(tempDir, "config.json"),
+			});
+			assert.equal(diagnostic.active, false);
+			assert.equal(diagnostic.wantsIntercom, true);
+			assert.equal(diagnostic.piIntercomAvailable, false);
+			assert.equal(diagnostic.reason, "pi-intercom extension was not found");
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves malformed intercom config errors while matching runtime enabled behavior", () => {
+		withMalformedIntercomConfig(({ extensionDir, configPath }) => {
+			const diagnostic = diagnoseIntercomBridge({
+				config: { mode: "always" },
+				context: "fresh",
+				orchestratorTarget: "main",
+				extensionDir,
+				configPath,
+			});
+			assert.equal(diagnostic.active, true);
+			assert.equal(diagnostic.intercomConfigEnabled, true);
+			assert.match(diagnostic.intercomConfigError ?? "", /SyntaxError:/);
+		});
+	});
+
+	it("does not report config parse errors when runtime would not read intercom config", () => {
+		withMalformedIntercomConfig(({ extensionDir, configPath }) => {
+			const diagnostic = diagnoseIntercomBridge({
+				config: { mode: "off" },
+				context: "fresh",
+				orchestratorTarget: "main",
+				extensionDir,
+				configPath,
+			});
+			assert.equal(diagnostic.active, false);
+			assert.equal(diagnostic.reason, "bridge mode is off");
+			assert.equal(diagnostic.intercomConfigEnabled, undefined);
+			assert.equal(diagnostic.intercomConfigError, undefined);
+		});
 	});
 });
 
@@ -179,7 +245,7 @@ describe("applyIntercomBridgeToAgent", () => {
 		mode: "always",
 		orchestratorTarget: "main",
 		extensionDir: "/Users/test/.pi/agent/extensions/pi-intercom",
-		instruction: "Intercom orchestration channel:\n- Need a decision or blocked: intercom({ action: \"ask\", to: \"main\", message: \"<question>\" })\n- Completion/update: intercom({ action: \"send\", to: \"main\", message: \"DONE: <summary>\" })",
+		instruction: "Intercom orchestration channel:\n- Need a decision or blocked: intercom({ action: \"ask\", to: \"main\", message: \"<question>\" })\n- Blocked/update: intercom({ action: \"send\", to: \"main\", message: \"UPDATE: <summary>\" })",
 	};
 
 	it("injects intercom tool and prompt instructions", () => {

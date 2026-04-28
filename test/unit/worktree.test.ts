@@ -10,6 +10,7 @@ import {
 	diffWorktrees,
 	findWorktreeTaskCwdConflict,
 	formatWorktreeDiffSummary,
+	resolveExpectedWorktreeAgentCwd,
 	type WorktreeSetup,
 } from "../../worktree.ts";
 
@@ -87,6 +88,24 @@ describe("worktree", () => {
 			assert.equal(setup.worktrees[0]!.agentCwd, path.join(setup.worktrees[0]!.path, "packages", "app"));
 		} finally {
 			if (setup) cleanupWorktrees(setup);
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("previews expected worktree agent cwd for repository subdirectories", () => {
+		const repoDir = createRepo("pi-worktree-preview-");
+		const nestedDir = path.join(repoDir, "packages", "app");
+		fs.mkdirSync(nestedDir, { recursive: true });
+		fs.writeFileSync(path.join(nestedDir, "index.ts"), "export const value = 1;\n", "utf-8");
+		git(repoDir, ["add", "-A"]);
+		git(repoDir, ["commit", "-m", "add nested dir"]);
+
+		try {
+			assert.equal(
+				resolveExpectedWorktreeAgentCwd(nestedDir, "preview", 2),
+				path.join(os.tmpdir(), "pi-worktree-preview-2", "packages", "app"),
+			);
+		} finally {
 			cleanupRepo(repoDir);
 		}
 	});
