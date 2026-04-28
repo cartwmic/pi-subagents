@@ -21,5 +21,6 @@ describe("registered subagent tool description", () => {
 		}
 		assert.match(description, /use \{ action: "list" \} to inspect configured agents\/chains/i);
 		assert.match(description, /executable\/non-disabled/i);
+		assert.match(description, /output\?,reads\?,progress\?/i);
 	});
 });

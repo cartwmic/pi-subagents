@@ -8,14 +8,14 @@ const DEFAULT_INTERCOM_EXTENSION_DIR = path.join(os.homedir(), ".pi", "agent", "
 const DEFAULT_INTERCOM_CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "intercom", "config.json");
 const DEFAULT_SUBAGENT_CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "subagent");
 const DEFAULT_INTERCOM_TARGET_PREFIX = "subagent-chat";
-const INTERCOM_BRIDGE_MARKER = "Intercom orchestration channel:";
+export const INTERCOM_BRIDGE_MARKER = "Intercom orchestration channel:";
 const DEFAULT_INTERCOM_BRIDGE_TEMPLATE = `The inherited thread is reference-only. Do not continue that conversation or send questions, status updates, or completion handoffs to the orchestrator in normal assistant text.
 
 Use intercom only for coordination with the orchestrator session "{orchestratorTarget}".
 - Need a decision or blocked: intercom({ action: "ask", to: "{orchestratorTarget}", message: "<question>" })
-- Need to report progress or a completion handoff: intercom({ action: "send", to: "{orchestratorTarget}", message: "DONE: <summary>" })
+- Blocked or explicitly asked to send progress: intercom({ action: "send", to: "{orchestratorTarget}", message: "UPDATE: <summary>" })
 
-If no upstream coordination is needed, continue the task normally and return a focused task result.`;
+Do not send routine completion handoffs through intercom. If no coordination is needed, return a focused task result.`;
 
 export interface IntercomBridgeState {
 	active: boolean;
@@ -23,6 +23,19 @@ export interface IntercomBridgeState {
 	orchestratorTarget?: string;
 	extensionDir: string;
 	instruction: string;
+}
+
+export interface IntercomBridgeDiagnostic {
+	active: boolean;
+	mode: IntercomBridgeMode;
+	wantsIntercom: boolean;
+	piIntercomAvailable: boolean;
+	extensionDir: string;
+	configPath?: string;
+	orchestratorTarget?: string;
+	reason?: string;
+	intercomConfigEnabled?: boolean;
+	intercomConfigError?: string;
 }
 
 interface ResolveIntercomBridgeInput {
@@ -68,14 +81,13 @@ function resolveIntercomBridgeConfig(value: ExtensionConfig["intercomBridge"]): 
 	};
 }
 
-function intercomEnabled(configPath: string): boolean {
-	if (!fs.existsSync(configPath)) return true;
+function intercomConfigStatus(configPath: string): { enabled: boolean; error?: unknown } {
+	if (!fs.existsSync(configPath)) return { enabled: true };
 	try {
 		const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as { enabled?: unknown };
-		return parsed.enabled !== false;
+		return { enabled: parsed.enabled !== false };
 	} catch (error) {
-		console.warn(`Failed to parse intercom config at '${configPath}'. Assuming enabled.`, error);
-		return true;
+		return { enabled: true, error };
 	}
 }
 
@@ -119,6 +131,44 @@ function buildIntercomBridgeInstruction(orchestratorTarget: string, template: st
 ${instruction}`;
 }
 
+export function diagnoseIntercomBridge(input: ResolveIntercomBridgeInput): IntercomBridgeDiagnostic {
+	const config = resolveIntercomBridgeConfig(input.config);
+	const mode = config.mode;
+	const extensionDir = path.resolve(input.extensionDir ?? DEFAULT_INTERCOM_EXTENSION_DIR);
+	const orchestratorTarget = input.orchestratorTarget?.trim();
+	const configPath = path.resolve(input.configPath ?? DEFAULT_INTERCOM_CONFIG_PATH);
+	const wantsIntercom = mode !== "off" && !(mode === "fork-only" && input.context !== "fork");
+	const piIntercomAvailable = fs.existsSync(extensionDir);
+	let configStatus: ReturnType<typeof intercomConfigStatus> | undefined;
+	let reason: string | undefined;
+	if (mode === "off") reason = "bridge mode is off";
+	else if (mode === "fork-only" && input.context !== "fork") reason = "bridge mode is fork-only and context is not fork";
+	else if (!orchestratorTarget) reason = "orchestrator target is not available";
+	else if (!piIntercomAvailable) reason = "pi-intercom extension was not found";
+	else {
+		configStatus = intercomConfigStatus(configPath);
+		if (!configStatus.enabled) reason = "intercom config is disabled";
+	}
+	let intercomConfigError: string | undefined;
+	if (configStatus?.error) {
+		const error = configStatus.error;
+		intercomConfigError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+	}
+
+	return {
+		active: reason === undefined,
+		mode,
+		wantsIntercom,
+		piIntercomAvailable,
+		extensionDir,
+		configPath,
+		...(orchestratorTarget ? { orchestratorTarget } : {}),
+		...(reason ? { reason } : {}),
+		...(configStatus ? { intercomConfigEnabled: configStatus.enabled } : {}),
+		...(intercomConfigError ? { intercomConfigError } : {}),
+	};
+}
+
 export function resolveIntercomBridge(input: ResolveIntercomBridgeInput): IntercomBridgeState {
 	const config = resolveIntercomBridgeConfig(input.config);
 	const mode = config.mode;
@@ -144,7 +194,9 @@ export function resolveIntercomBridge(input: ResolveIntercomBridgeInput): Interc
 	}
 
 	const configPath = path.resolve(input.configPath ?? DEFAULT_INTERCOM_CONFIG_PATH);
-	if (!intercomEnabled(configPath)) {
+	const intercomStatus = intercomConfigStatus(configPath);
+	if (intercomStatus.error) console.warn(`Failed to parse intercom config at '${configPath}'. Assuming enabled.`, intercomStatus.error);
+	if (!intercomStatus.enabled) {
 		return { active: false, mode, extensionDir, instruction: defaultInstruction };
 	}
 

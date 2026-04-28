@@ -36,6 +36,10 @@ interface SubagentParamsSchema {
 			type?: string;
 			description?: string;
 		};
+		action?: {
+			type?: string;
+			description?: string;
+		};
 		control?: {
 			properties?: {
 				needsAttentionAfterMs?: { minimum?: number };
@@ -79,15 +83,28 @@ describe("SubagentParams schema", { skip: !available ? "typebox not available" :
 	});
 
 	it("includes count and concurrency on top-level parallel mode", () => {
-		const taskCountSchema = SubagentParams?.properties?.tasks?.items?.properties?.count;
+		const taskSchema = SubagentParams?.properties?.tasks?.items?.properties;
+		const taskCountSchema = taskSchema?.count;
 		assert.ok(taskCountSchema, "tasks[].count schema should exist");
 		assert.equal(taskCountSchema.minimum, 1);
 		assert.match(String(taskCountSchema.description ?? ""), /repeat/i);
+		assert.deepEqual(taskSchema?.output?.type, ["string", "boolean"]);
+		assert.deepEqual(taskSchema?.reads?.type, ["array", "boolean"]);
+		assert.deepEqual(taskSchema?.reads?.items, { type: "string" });
+		assert.equal(taskSchema?.progress?.type, "boolean");
 
 		const concurrencySchema = SubagentParams?.properties?.concurrency;
 		assert.ok(concurrencySchema, "concurrency schema should exist");
 		assert.equal(concurrencySchema.minimum, 1);
 		assert.match(String(concurrencySchema.description ?? ""), /parallel/i);
+	});
+
+	it("includes diagnostics action documentation", () => {
+		const actionSchema = SubagentParams?.properties?.action;
+		assert.ok(actionSchema, "action schema should exist");
+		assert.equal(actionSchema.type, "string");
+		assert.match(String(actionSchema.description ?? ""), /doctor/);
+		assert.match(String(actionSchema.description ?? ""), /diagnostics/i);
 	});
 
 	it("includes subagent control fields", () => {
@@ -208,6 +225,7 @@ describe("SubagentParams schema", { skip: !available ? "typebox not available" :
 			{ skill: false },
 			{ tasks: [{ agent: "reviewer", task: "check this", skill: "review" }] },
 			{ tasks: [{ agent: "reviewer", task: "check this", skill: false }] },
+			{ tasks: [{ agent: "reviewer", task: "check this", output: "review.md", reads: ["input.md"], progress: true }] },
 			{ chain: [{ agent: "reviewer", reads: false }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", reads: false, skill: false }] }] },
 			{ config: { name: "reviewer", description: "Review things" } },
