@@ -12,6 +12,7 @@ import { handleManagementAction } from "./agent-management.ts";
 import { buildDoctorReport } from "./doctor.ts";
 import { runSync } from "./execution.ts";
 import { classifyRunForNotice } from "./liveness.ts";
+import { getForegroundControl, formatForegroundActivity } from "./foreground-control.ts";
 import { resolveModelCandidate } from "./model-fallback.ts";
 import { aggregateParallelOutputs } from "./parallel-utils.ts";
 import { recordRun } from "./run-history.ts";
@@ -128,6 +129,13 @@ interface ExecutorDeps {
 	getSubagentSessionRoot: (parentSessionFile: string | null) => string;
 	expandTilde: (p: string) => string;
 	discoverAgents: (cwd: string, scope: AgentScope) => { agents: AgentConfig[] };
+	/**
+	 * Optional alias for `globalThis as Record<string, unknown>`. Threaded into
+	 * `inspectSubagentStatus` so the recently-terminal lookup branch can read
+	 * `globalStore.__piSubagentRecentlyTerminalRuns`. Defaults to undefined for
+	 * backward compatibility with test/legacy harnesses.
+	 */
+	globalStore?: Record<string, unknown>;
 }
 
 interface ExecutionContextData {
@@ -154,38 +162,10 @@ function resolveRequestedCwd(runtimeCwd: string, requestedCwd: string | undefine
 	return requestedCwd ? path.resolve(runtimeCwd, requestedCwd) : runtimeCwd;
 }
 
-function getForegroundControl(state: SubagentState, runId: string | undefined) {
-	if (runId) return state.foregroundControls.get(runId);
-	if (state.lastForegroundControlId) {
-		const latest = state.foregroundControls.get(state.lastForegroundControlId);
-		if (latest) return latest;
-	}
-	let newest: (SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never) | undefined;
-	for (const control of state.foregroundControls.values()) {
-		if (!newest || control.updatedAt > newest.updatedAt) newest = control;
-	}
-	return newest;
-}
-
-function formatForegroundActivity(control: SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never): string | undefined {
-	if (control.currentTool && control.currentToolStartedAt) {
-		return `tool ${control.currentTool} for ${Math.floor(Math.max(0, Date.now() - control.currentToolStartedAt) / 1000)}s`;
-	}
-	if (!control.lastActivityAt) return control.currentActivityState === "needs_attention" ? "needs attention" : undefined;
-	const seconds = Math.floor(Math.max(0, Date.now() - control.lastActivityAt) / 1000);
-	return control.currentActivityState === "needs_attention" ? `no activity for ${seconds}s` : `active ${seconds}s ago`;
-}
-
-function foregroundStatusResult(control: SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never): AgentToolResult<Details> {
-	const lines = [
-		`Run: ${control.runId}`,
-		"State: running",
-		`Mode: ${control.mode}`,
-		control.currentAgent ? `Current: ${control.currentAgent}${control.currentIndex !== undefined ? ` step ${control.currentIndex + 1}` : ""}` : undefined,
-		formatForegroundActivity(control) ? `Activity: ${formatForegroundActivity(control)}` : undefined,
-	].filter((line): line is string => Boolean(line));
-	return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "management", results: [] } };
-}
+// `getForegroundControl` and `formatForegroundActivity` were relocated to
+// `foreground-control.ts` so `run-status.ts` can reuse them for the
+// `action:"status"` consolidated lookup. `foregroundStatusResult` was
+// removed entirely — status responses are now built by `inspectSubagentStatus`.
 
 function getAsyncInterruptTarget(state: SubagentState, runId: string | undefined): { asyncId: string; asyncDir: string } | undefined {
 	if (runId) {
@@ -1689,9 +1669,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				};
 			}
 			if (params.action === "status") {
-				const foreground = getForegroundControl(deps.state, paramsWithResolvedCwd.id ?? paramsWithResolvedCwd.runId);
-				if (foreground) return foregroundStatusResult(foreground);
-				return inspectSubagentStatus(paramsWithResolvedCwd);
+				return inspectSubagentStatus(paramsWithResolvedCwd, deps.state, deps.globalStore);
 			}
 			if (params.action === "interrupt") {
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;

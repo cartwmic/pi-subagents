@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+- Subagent control notices for runs that completed during the parent's pending tool call are no longer surfaced as false-alarm "idle subagent" warnings. Notices are now buffered into a per-run pending queue and re-checked for liveness at flush time (`pi.on("tool_result")` + 5s fallback timer). Bus-emit gates added at all four emit sites; recently-terminal map plumbed through to consumers. (`fix-control-notice-liveness-gate`)
+
+### Added
+- `subagent({action:"status", id})` now resolves runs across four stores in precedence order: async > results > foreground > recently-terminal. Foreground responses are enriched with `runMode`, `currentAgent`, `currentIndex`, `lastActivityAt`, `activityState`, and `durationMs`. Recently-terminal responses report `terminalState`, `terminatedAt`, and `ageSeconds`. Each successful response carries a `details.lookup` discriminator. (`add-foreground-run-status-lookup`)
+- `subagent({action:"doctor"})` now reports a "Control notices" section with `dropped stale notices`, `deduped notices`, `recently-terminal runs` (size + oldest age), and `pending notices` counters. (`fix-control-notice-liveness-gate`)
+
+### Changed (BEHAVIOR)
+- `inspectSubagentStatus` previously returned `isError: true` when a run was no longer present in any store. It now returns `isError: false` for recently-terminal hits (within `RECENT_TERMINAL_TTL_MS = 30s`), distinguished by `details.lookup === "recently-terminal"`. Callers branching on `isError === true` for the "run gone" case should switch to checking `details.lookup`. The truly-not-found case still returns `isError: true`. Fully backward-compatible for all previously-successful response shapes (each gains an additive `details.lookup`). (`add-foreground-run-status-lookup`)
+
 ## [0.20.1] - 2026-04-27
 
 ### Fixed
