@@ -40,6 +40,12 @@ export interface DoctorReportInput {
 	expandTilde?: (value: string) => string;
 	paths?: DoctorPaths;
 	deps?: Partial<DoctorDeps>;
+	/**
+	 * Optional globalStore alias used by the "Control notices" section to read
+	 * counters and the recently-terminal map. Populated by callers that have
+	 * the extension's globalThis-derived alias in scope (subagent-executor.ts).
+	 */
+	globalStore?: Record<string, unknown>;
 }
 
 const DEFAULT_PATHS: DoctorPaths = {
@@ -151,6 +157,50 @@ function formatDiscovery(input: DoctorReportInput, deps: DoctorDeps): string[] {
 	];
 }
 
+interface RecentTerminalEntryShape {
+	terminatedAt: number;
+	terminalState: string;
+}
+
+function formatControlNoticeLines(input: DoctorReportInput): string[] {
+	const store = input.globalStore;
+	if (!store) {
+		return [
+			"- dropped stale notices: 0",
+			"- deduped notices: 0",
+			"- recently-terminal runs: 0 (oldest: (empty))",
+			"- pending notices: 0",
+		];
+	}
+	const dropped = (store.__piSubagentDroppedStaleNotices as number) ?? 0;
+	const deduped = (store.__piSubagentDedupedNotices as number) ?? 0;
+	const recentlyTerminal =
+		store.__piSubagentRecentlyTerminalRuns instanceof Map
+			? (store.__piSubagentRecentlyTerminalRuns as Map<string, RecentTerminalEntryShape>)
+			: new Map<string, RecentTerminalEntryShape>();
+	const pending =
+		store.__piSubagentPendingNotices instanceof Map
+			? (store.__piSubagentPendingNotices as Map<string, unknown>)
+			: new Map<string, unknown>();
+	let oldestAge: string;
+	if (recentlyTerminal.size === 0) {
+		oldestAge = "(empty)";
+	} else {
+		let oldest = Infinity;
+		for (const entry of recentlyTerminal.values()) {
+			if (entry.terminatedAt < oldest) oldest = entry.terminatedAt;
+		}
+		const ageMs = Math.max(0, Date.now() - oldest);
+		oldestAge = `${(ageMs / 1000).toFixed(1)}s`;
+	}
+	return [
+		`- dropped stale notices: ${dropped}`,
+		`- deduped notices: ${deduped}`,
+		`- recently-terminal runs: ${recentlyTerminal.size} (oldest: ${oldestAge})`,
+		`- pending notices: ${pending.size}`,
+	];
+}
+
 function formatIntercomDiagnostic(diagnostic: IntercomBridgeDiagnostic, context: "fresh" | "fork" | undefined): string[] {
 	const lines = [
 		`- bridge: ${diagnostic.active ? "active" : "inactive"}${diagnostic.reason ? ` (${diagnostic.reason})` : ""}`,
@@ -193,6 +243,9 @@ export function buildDoctorReport(input: DoctorReportInput): string {
 			context: input.context,
 			orchestratorTarget: input.orchestratorTarget,
 		}), input.context).join("\n")).split("\n"),
+		"",
+		"Control notices",
+		...formatControlNoticeLines(input),
 	];
 	return lines.join("\n");
 }

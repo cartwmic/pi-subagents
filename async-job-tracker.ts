@@ -1,6 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { classifyRunForNotice } from "./liveness.ts";
+import { recordTerminalRun } from "./recent-terminal.ts";
 import { renderWidget } from "./render.ts";
 import { formatControlNoticeMessage } from "./subagent-control.ts";
 import {
@@ -12,6 +14,8 @@ import {
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
 } from "./types.ts";
 import { readStatus } from "./utils.ts";
+
+const globalStore = globalThis as Record<string, unknown>;
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -80,15 +84,23 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					childIntercomTarget: record.childIntercomTarget,
 					noticeText: record.noticeText ?? formatControlNoticeMessage(record.event, record.childIntercomTarget),
 				};
+				// Layer B gate (Section 6): drop replayed events for runs that have
+				// already terminated. The async tracker reads events.jsonl after the
+				// runner has already written them, so the run is often stale by now.
+				const runId = record.event.runId;
 				if (record.channels.includes("event")) {
-					pi.events.emit(SUBAGENT_CONTROL_EVENT, payload);
+					if (classifyRunForNotice(state, runId) !== "stale") {
+						pi.events.emit(SUBAGENT_CONTROL_EVENT, payload);
+					}
 				}
 				if (record.channels.includes("intercom") && record.intercom?.to && record.intercom.message) {
-					pi.events.emit(SUBAGENT_CONTROL_INTERCOM_EVENT, {
-						...payload,
-						to: record.intercom.to,
-						message: record.intercom.message,
-					});
+					if (classifyRunForNotice(state, runId) !== "stale") {
+						pi.events.emit(SUBAGENT_CONTROL_INTERCOM_EVENT, {
+							...payload,
+							to: record.intercom.to,
+							message: record.intercom.message,
+						});
+					}
 				}
 			}
 		} catch (error) {
@@ -112,10 +124,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 
 			for (const job of state.asyncJobs.values()) {
 				try {
-					emitNewControlEvents(job);
+					// Decision 9: read disk status BEFORE emitting control events so the
+					// bus-emit gate (Batch 5) sees the just-transitioned job.status.
+					const previousStatus = job.status;
 					const status = readStatus(job.asyncDir);
 					if (status) {
-						const previousStatus = job.status;
 						job.status = status.state;
 						job.activityState = status.activityState;
 						job.lastActivityAt = status.lastActivityAt ?? job.lastActivityAt;
@@ -133,13 +146,21 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						job.outputFile = status.outputFile ?? job.outputFile;
 						job.totalTokens = status.totalTokens ?? job.totalTokens;
 						job.sessionFile = status.sessionFile ?? job.sessionFile;
-						if ((job.status === "complete" || job.status === "failed" || job.status === "paused") && previousStatus !== job.status) {
-							scheduleCleanup(job.asyncId);
-						}
-						continue;
+					} else {
+						job.status = job.status === "queued" ? "running" : job.status;
+						job.updatedAt = Date.now();
 					}
-					job.status = job.status === "queued" ? "running" : job.status;
-					job.updatedAt = Date.now();
+					emitNewControlEvents(job);
+					if (status && (job.status === "complete" || job.status === "failed" || job.status === "paused") && previousStatus !== job.status) {
+						if (job.status === "complete" || job.status === "failed") {
+							recordTerminalRun(
+								globalStore,
+								job.asyncId,
+								job.status === "complete" ? "succeeded" : "failed",
+							);
+						}
+						scheduleCleanup(job.asyncId);
+					}
 				} catch (error) {
 					console.error(`Failed to read async status for '${job.asyncDir}':`, error);
 					job.status = "failed";
@@ -192,6 +213,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (state.lastUiContext) {
 			rerenderWidget(state.lastUiContext);
 		}
+		// First-write-wins in recordTerminalRun handles dedup with the poll branch.
+		recordTerminalRun(
+			globalStore,
+			asyncId,
+			result.success ? "succeeded" : "failed",
+		);
 		scheduleCleanup(asyncId);
 	};
 

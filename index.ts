@@ -16,7 +16,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import { type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Box, Container, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@mariozechner/pi-tui";
 import { discoverAgents } from "./agents.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "./artifacts.ts";
@@ -48,6 +48,8 @@ import {
 	SUBAGENT_CONTROL_EVENT,
 	WIDGET_KEY,
 } from "./types.ts";
+import { classifyRunForNotice, setLivenessGlobals } from "./liveness.ts";
+import { sweepRecentTerminalRuns } from "./recent-terminal.ts";
 
 /**
  * Derive subagent session base directory from parent session file.
@@ -199,10 +201,15 @@ function parseSubagentNotifyContent(content: string): SubagentNotifyDetails | un
 }
 
 class SubagentControlNoticeComponent implements Component {
+	private readonly details: SubagentControlMessageDetails;
+	private readonly theme: ExtensionContext["ui"]["theme"];
 	constructor(
-		private readonly details: SubagentControlMessageDetails,
-		private readonly theme: ExtensionContext["ui"]["theme"],
-	) {}
+		details: SubagentControlMessageDetails,
+		theme: ExtensionContext["ui"]["theme"],
+	) {
+		this.details = details;
+		this.theme = theme;
+	}
 
 	invalidate(): void {}
 
@@ -226,6 +233,121 @@ class SubagentControlNoticeComponent implements Component {
 	}
 }
 
+// ── globalStore key constants ──────────────────────────────────────────────
+const __piSubagentRecentlyTerminalRuns = "__piSubagentRecentlyTerminalRuns";
+const __piSubagentDroppedStaleNotices = "__piSubagentDroppedStaleNotices";
+const __piSubagentDedupedNotices = "__piSubagentDedupedNotices";
+const __piSubagentPendingNotices = "__piSubagentPendingNotices";
+const __piSubagentSweepTimer = "__piSubagentSweepTimer";
+const __piSubagentFlushFallbackTimer = "__piSubagentFlushFallbackTimer";
+// Key for the dedup set — defined at module level so flushPendingNotices can use it.
+export const visibleControlNoticesStoreKey = "__piSubagentVisibleControlNotices";
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Shape of an entry in the pending-notices buffer. */
+export interface PendingNoticeEntry {
+	arrivedAt: number;
+	payload: SubagentControlMessageDetails;
+	runId: string;
+	noticeText: string;
+}
+
+/**
+ * Process an incoming SUBAGENT_CONTROL_EVENT through the liveness gate.
+ *
+ * - Stale run  → increment droppedStaleNotices, return (DO NOT touch dedup set).
+ * - Already deduped → increment dedupedNotices, return.
+ * - Live, new  → write entry into the pending-notices buffer for flush-time re-check.
+ *
+ * Exported for unit tests; also used as the closure body of controlEventHandler.
+ */
+export function processControlEvent(
+	payload: unknown,
+	globalStore: Record<string, unknown>,
+	state: SubagentState,
+	visibleControlNotices: Set<string>,
+): void {
+	const details = payload as SubagentControlMessageDetails;
+	if (!details?.event) return;
+	const childIntercomTarget = controlNoticeTarget(details);
+	const key = controlNotificationKey(details.event, childIntercomTarget);
+
+	// Layer C gate: re-check liveness before even buffering.
+	if (classifyRunForNotice(state, details.event.runId) === "stale") {
+		globalStore[__piSubagentDroppedStaleNotices] =
+			((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) + 1;
+		// DO NOT add key to visibleControlNotices (Decision 6 / no-poisoning rule).
+		return;
+	}
+
+	// Dedup check.
+	if (visibleControlNotices.has(key)) {
+		globalStore[__piSubagentDedupedNotices] =
+			((globalStore[__piSubagentDedupedNotices] as number) ?? 0) + 1;
+		return;
+	}
+
+	// Write to pending buffer — delivery (and dedup-set update) happens at flush time.
+	const noticeText =
+		details.noticeText ?? formatControlNoticeMessage(details.event, childIntercomTarget);
+	const pending = globalStore[__piSubagentPendingNotices] as Map<string, PendingNoticeEntry>;
+	pending.set(key, {
+		arrivedAt: Date.now(),
+		payload: { ...details, childIntercomTarget, noticeText },
+		runId: details.event.runId,
+		noticeText,
+	});
+}
+
+/**
+ * Flush all pending control notices, re-checking liveness at delivery time.
+ *
+ * - Live at flush  → pi.sendMessage, add key to dedup set, remove from buffer.
+ * - Stale at flush → increment droppedStaleNotices, remove from buffer.
+ * - Older than 60s → same as stale (TTL safety).
+ *
+ * Exported for unit tests and wired as a flush trigger.
+ */
+export function flushPendingNotices(
+	pi: { sendMessage(msg: unknown, opts: unknown): void },
+	globalStore: Record<string, unknown>,
+	state: SubagentState,
+): void {
+	const pending = globalStore[__piSubagentPendingNotices] as Map<string, PendingNoticeEntry>;
+	if (!pending || pending.size === 0) return;
+	const visible = globalStore[visibleControlNoticesStoreKey] as Set<string>;
+	const now = Date.now();
+	const keysToDelete: string[] = [];
+	for (const [key, entry] of pending) {
+		// Optional pending-buffer TTL safety (60s).
+		if (now - entry.arrivedAt > 60_000) {
+			globalStore[__piSubagentDroppedStaleNotices] =
+				((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) + 1;
+			keysToDelete.push(key);
+			continue;
+		}
+		const liveness = classifyRunForNotice(state, entry.runId);
+		if (liveness === "live") {
+			pi.sendMessage(
+				{
+					customType: SUBAGENT_CONTROL_MESSAGE_TYPE,
+					content: entry.noticeText,
+					display: true,
+					details: entry.payload,
+				},
+				{ triggerTurn: true },
+			);
+			visible.add(key);
+			keysToDelete.push(key);
+		} else {
+			globalStore[__piSubagentDroppedStaleNotices] =
+				((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) + 1;
+			keysToDelete.push(key);
+		}
+	}
+	for (const k of keysToDelete) pending.delete(k);
+}
+
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const globalStore = globalThis as Record<string, unknown>;
 	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
@@ -237,6 +359,25 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			// Best effort cleanup for stale timers from an older reload.
 		}
 	}
+
+	// Lazily initialize globalStore keys so they survive ctx.reload().
+	if (!(globalStore[__piSubagentRecentlyTerminalRuns] instanceof Map)) {
+		globalStore[__piSubagentRecentlyTerminalRuns] = new Map();
+	}
+	if (!(globalStore[__piSubagentPendingNotices] instanceof Map)) {
+		globalStore[__piSubagentPendingNotices] = new Map();
+	}
+	if (typeof globalStore[__piSubagentDroppedStaleNotices] !== "number") {
+		globalStore[__piSubagentDroppedStaleNotices] = 0;
+	}
+	if (typeof globalStore[__piSubagentDedupedNotices] !== "number") {
+		globalStore[__piSubagentDedupedNotices] = 0;
+	}
+	// __piSubagentSweepTimer and __piSubagentFlushFallbackTimer are left
+	// undefined here; Section 7 (timer install/cleanup) owns their lifecycle.
+
+	// Wire liveness globals ONCE before any event handlers are installed.
+	setLivenessGlobals(globalStore);
 
 	ensureAccessibleDir(RESULTS_DIR);
 	ensureAccessibleDir(ASYNC_DIR);
@@ -274,7 +415,35 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	startResultWatcher();
 	primeExistingResults();
 
+	let flushToolResultUnsub: (() => void) | undefined;
+
 	const runtimeCleanup = () => {
+		// Drop all pending notices without flushing (Decision 8: stale pi on reload).
+		const pendingOnCleanup = globalStore[__piSubagentPendingNotices] as
+			| Map<string, PendingNoticeEntry>
+			| undefined;
+		if (pendingOnCleanup && pendingOnCleanup.size > 0) {
+			globalStore[__piSubagentDroppedStaleNotices] =
+				((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) +
+				pendingOnCleanup.size;
+			pendingOnCleanup.clear();
+		}
+		// Section 7: clear sweep timer in addition to existing cleanup.
+		if (globalStore[__piSubagentSweepTimer]) {
+			clearInterval(globalStore[__piSubagentSweepTimer] as NodeJS.Timeout);
+			globalStore[__piSubagentSweepTimer] = undefined;
+		}
+		// Clear the fallback flush timer.
+		if (globalStore[__piSubagentFlushFallbackTimer]) {
+			clearInterval(globalStore[__piSubagentFlushFallbackTimer] as NodeJS.Timeout);
+			globalStore[__piSubagentFlushFallbackTimer] = undefined;
+		}
+		// Unsubscribe the flush tool_result listener.
+		try {
+			flushToolResultUnsub?.();
+		} catch {
+			// Best effort.
+		}
 		stopWidgetAnimation();
 		stopResultAnimations();
 		if (state.poller) {
@@ -472,7 +641,6 @@ DIAGNOSTICS:
 	registerSlashCommands(pi, state);
 
 	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
-	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";
 	const previousEventUnsubscribes = globalStore[eventUnsubscribeStoreKey];
 	if (Array.isArray(previousEventUnsubscribes)) {
 		for (const unsubscribe of previousEventUnsubscribes) {
@@ -486,26 +654,46 @@ DIAGNOSTICS:
 	}
 	registerSubagentNotify(pi);
 
-	const existingVisibleControlNotices = globalStore[controlNoticeSeenStoreKey];
-	const visibleControlNotices = existingVisibleControlNotices instanceof Set ? existingVisibleControlNotices as Set<string> : new Set<string>();
-	globalStore[controlNoticeSeenStoreKey] = visibleControlNotices;
+	const existingVisibleControlNotices = globalStore[visibleControlNoticesStoreKey];
+	const visibleControlNotices =
+		existingVisibleControlNotices instanceof Set
+			? (existingVisibleControlNotices as Set<string>)
+			: new Set<string>();
+	globalStore[visibleControlNoticesStoreKey] = visibleControlNotices;
+
+	// Task 5.3: NEW flush listener — fires for every subagent tool_result regardless
+	// of ctx.hasUI. Separate from the existing handler below (which early-returns on
+	// !ctx.hasUI and handles widget rendering). The unsub is stored in flushToolResultUnsub
+	// so runtimeCleanup can call it.
+	flushToolResultUnsub = pi.on("tool_result", (event, _ctx) => {
+		if (event.toolName !== "subagent") return;
+		flushPendingNotices(pi, globalStore, state);
+	});
+
+	// Task 5.4: Fallback flush timer (5s). Clear any stale timer from a prior reload
+	// before installing a fresh one.
+	if (globalStore[__piSubagentFlushFallbackTimer]) {
+		clearInterval(globalStore[__piSubagentFlushFallbackTimer] as NodeJS.Timeout);
+	}
+	const flushFallback = setInterval(() => {
+		flushPendingNotices(pi, globalStore, state);
+	}, 5_000);
+	flushFallback.unref();
+	globalStore[__piSubagentFlushFallbackTimer] = flushFallback;
+
+	// Section 7: install the recently-terminal sweep timer (60s). Clear any stale
+	// timer from a prior reload before installing a fresh one (Task 7.1).
+	if (globalStore[__piSubagentSweepTimer]) {
+		clearInterval(globalStore[__piSubagentSweepTimer] as NodeJS.Timeout);
+	}
+	const sweepTimer = setInterval(() => {
+		sweepRecentTerminalRuns(globalStore);
+	}, 60_000);
+	sweepTimer.unref();
+	globalStore[__piSubagentSweepTimer] = sweepTimer;
+
 	const controlEventHandler = (payload: unknown) => {
-		const details = payload as SubagentControlMessageDetails;
-		if (!details?.event) return;
-		const childIntercomTarget = controlNoticeTarget(details);
-		const key = controlNotificationKey(details.event, childIntercomTarget);
-		if (visibleControlNotices.has(key)) return;
-		visibleControlNotices.add(key);
-		const noticeText = details.noticeText ?? formatControlNoticeMessage(details.event, childIntercomTarget);
-		pi.sendMessage(
-			{
-				customType: SUBAGENT_CONTROL_MESSAGE_TYPE,
-				content: noticeText,
-				display: true,
-				details: { ...details, childIntercomTarget, noticeText },
-			},
-			{ triggerTurn: true },
-		);
+		processControlEvent(payload, globalStore, state, visibleControlNotices);
 	};
 	const eventUnsubscribes = [
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted),
@@ -514,6 +702,7 @@ DIAGNOSTICS:
 	];
 	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
 
+	// Existing tool_result handler (widget rendering, UI-only). Left unchanged.
 	pi.on("tool_result", (event, ctx) => {
 		if (event.toolName !== "subagent") return;
 		if (!ctx.hasUI) return;
