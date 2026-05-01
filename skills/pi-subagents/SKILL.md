@@ -478,6 +478,15 @@ Use subagent control proactively when a delegated run emits `needs_attention`, o
 
 Use `/name` so intercom targeting stays stable.
 
+## Reading control notices
+
+When pi-subagents flags a child run as `needs_attention`, the parent receives a notice that includes a `Status:` and `Interrupt:` command (and per-step `Nudge:` lines when intercom is wired). Defaults: notice fires after **180s** of no observed activity; multiple stalled steps for the same run are coalesced into a single multi-step notice over a **1s** window.
+
+- **Don't reflexively call `Status:`.** For parallel runs without intercom, `Interrupt` is usually the right move — the notice already includes the runId.
+- **Wait at least one `coalesceWindowMs` (default 1s) before status-checking** if you do reach for `Status:`. The first notice may still be in the buffer; querying immediately can race with the flush.
+- **Multi-step notices** (header `Subagent needs attention: run <runId> (<N> steps)`) mean N child steps stalled together. Treat the whole run as the unit — one `Interrupt` call covers all of them.
+- **A notice followed by `Status:` returning recently-terminal** means the run finished while the notice was buffering. The `details.lookup === "recently-terminal"` branch reports `terminalState` (succeeded / failed / interrupted) and `ageSeconds`; it is **not** an error — the run completed and the transcript has rolled off in-memory state.
+
 ## Common Workflows
 
 ### Recon → Plan → Implement

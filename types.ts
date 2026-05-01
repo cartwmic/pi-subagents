@@ -49,6 +49,14 @@ export interface ControlConfig {
 	needsAttentionAfterMs?: number;
 	notifyOn?: ControlEventType[];
 	notifyChannels?: ControlNotificationChannel[];
+	/**
+	 * Per-runId coalesce window in ms. Within this window after the first
+	 * `needs_attention` event for a run, additional events are buffered and
+	 * delivered as a single multi-step notice. `0` disables coalescing
+	 * (each event still routes through the liveness gate at flush time).
+	 * Negative / non-integer / NaN falls back to the default 1000ms.
+	 */
+	coalesceWindowMs?: number;
 }
 
 export interface ResolvedControlConfig {
@@ -56,6 +64,7 @@ export interface ResolvedControlConfig {
 	needsAttentionAfterMs: number;
 	notifyOn: ControlEventType[];
 	notifyChannels: ControlNotificationChannel[];
+	coalesceWindowMs: number;
 }
 
 export interface ControlEvent {
@@ -67,6 +76,10 @@ export interface ControlEvent {
 	index?: number;
 	runId: string;
 	message: string;
+	/** Last observed activity timestamp (ms epoch). Optional, additive. */
+	lastActivityAt?: number;
+	/** Time elapsed since last activity (ms). Optional, additive. */
+	elapsedMs?: number;
 }
 
 export type SubagentResultStatus = "completed" | "failed" | "paused" | "detached";

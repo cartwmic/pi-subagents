@@ -77,13 +77,19 @@ const {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-const __piSubagentPendingNotices = "__piSubagentPendingNotices";
+// improve-control-notice-tuning Section 5: __piSubagentPendingNotices was
+// replaced by per-runId coalesce buffers in __piSubagentControlNoticeBuffers.
+const __piSubagentControlNoticeBuffers = "__piSubagentControlNoticeBuffers";
+const __piSubagentSyncFlushDedup = "__piSubagentSyncFlushDedup";
+const __piSubagentRunFlushEpoch = "__piSubagentRunFlushEpoch";
 const __piSubagentDroppedStaleNotices = "__piSubagentDroppedStaleNotices";
 const __piSubagentDedupedNotices = "__piSubagentDedupedNotices";
 
 function makeStore(): Record<string, unknown> {
 	const store: Record<string, unknown> = {};
-	store[__piSubagentPendingNotices] = new Map();
+	store[__piSubagentControlNoticeBuffers] = new Map();
+	store[__piSubagentSyncFlushDedup] = new Map();
+	store[__piSubagentRunFlushEpoch] = new Map();
 	store[__piSubagentDroppedStaleNotices] = 0;
 	store[__piSubagentDedupedNotices] = 0;
 	store[visibleControlNoticesStoreKey] = new Set<string>();
@@ -131,6 +137,10 @@ function makeFakePi() {
 function makePayload(runId: string) {
 	return {
 		event: buildControlEvent({ to: "stuck", runId, agent: "test-agent" }),
+		// improve-control-notice-tuning: use coalesceWindowMs===0 for synchronous
+		// flush behavior in tests (matches the change-1-era expectation that
+		// processControlEvent + flushPendingNotices fully resolve in one tick).
+		coalesceWindowMs: 0,
 	};
 }
 
@@ -149,6 +159,10 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 		const visible = store[visibleControlNoticesStoreKey] as Set<string>;
 		const sizeBefore = visible.size;
 
+		// coalesceWindowMs===0 in payload makes processControlEvent flush
+		// synchronously, which applies the per-event liveness gate and counts
+		// the drop into droppedStaleNotices.
+		(store as { __piSubagentLastPi?: unknown }).__piSubagentLastPi = makeFakePi();
 		processControlEvent(makePayload("run-stale"), store, state, visible);
 
 		assert.equal(
@@ -162,9 +176,9 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 			"droppedStaleNotices must be 1 after a stale drop",
 		);
 		assert.equal(
-			(store[__piSubagentPendingNotices] as Map<string, unknown>).size,
+			(store[__piSubagentControlNoticeBuffers] as Map<string, unknown>).size,
 			0,
-			"pending buffer must remain empty",
+			"coalesce buffer must remain empty after sync flush",
 		);
 	});
 
@@ -178,10 +192,20 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 		const visible = store[visibleControlNoticesStoreKey] as Set<string>;
 		const pi = makeFakePi();
 
-		processControlEvent(makePayload("run-live"), store, state, visible);
+		// Use coalesceWindowMs > 0 so the event is buffered (not sync-flushed).
+		processControlEvent(
+			{
+				event: buildControlEvent({ to: "stuck", runId: "run-live", agent: "test-agent" }),
+				coalesceWindowMs: 1000,
+			},
+			store,
+			state,
+			visible,
+		);
 
-		const pending = store[__piSubagentPendingNotices] as Map<string, unknown>;
-		assert.equal(pending.size, 1, "pending buffer must have exactly one entry");
+		const buffers = store[__piSubagentControlNoticeBuffers] as Map<string, { events: unknown[] }>;
+		assert.equal(buffers.size, 1, "coalesce buffer must have exactly one runId");
+		assert.equal(buffers.get("run-live")?.events.length, 1, "buffer must hold one event");
 		assert.equal(pi.calls.length, 0, "pi.sendMessage must NOT be called at event-receive time");
 		assert.equal(visible.size, 0, "visibleControlNotices must not be updated until flush");
 	});
@@ -196,8 +220,16 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 		const visible = store[visibleControlNoticesStoreKey] as Set<string>;
 		const pi = makeFakePi();
 
-		// Notice arrives while live → goes to pending buffer.
-		processControlEvent(makePayload("run-terminates"), store, state, visible);
+		// Notice arrives while live → goes to coalesce buffer (window > 0).
+		processControlEvent(
+			{
+				event: buildControlEvent({ to: "stuck", runId: "run-terminates", agent: "test-agent" }),
+				coalesceWindowMs: 1000,
+			},
+			store,
+			state,
+			visible,
+		);
 
 		// Run terminates: remove from foregroundControls.
 		(state.foregroundControls as Map<string, unknown>).delete("run-terminates");
@@ -208,9 +240,9 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 		assert.equal(pi.calls.length, 0, "pi.sendMessage must NOT be called for a stale-at-flush notice");
 		assert.equal(store[__piSubagentDroppedStaleNotices], 1, "droppedStaleNotices must be 1");
 		assert.equal(
-			(store[__piSubagentPendingNotices] as Map<string, unknown>).size,
+			(store[__piSubagentControlNoticeBuffers] as Map<string, unknown>).size,
 			0,
-			"pending buffer must be empty after flush",
+			"coalesce buffer must be empty after flush",
 		);
 	});
 
@@ -224,17 +256,25 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 		const visible = store[visibleControlNoticesStoreKey] as Set<string>;
 		const pi = makeFakePi();
 
-		processControlEvent(makePayload("run-stays-live"), store, state, visible);
+		processControlEvent(
+			{
+				event: buildControlEvent({ to: "stuck", runId: "run-stays-live", agent: "test-agent" }),
+				coalesceWindowMs: 1000,
+			},
+			store,
+			state,
+			visible,
+		);
 
 		// Run is still live — don't remove it.
 		flushPendingNotices(pi, store, state);
 
 		assert.equal(pi.calls.length, 1, "pi.sendMessage must be called exactly once");
-		assert.equal(visible.size, 1, "visibleControlNotices must contain the key after flush");
+		assert.equal(visible.size, 1, "visibleControlNotices must contain the epoch key after flush");
 		assert.equal(
-			(store[__piSubagentPendingNotices] as Map<string, unknown>).size,
+			(store[__piSubagentControlNoticeBuffers] as Map<string, unknown>).size,
 			0,
-			"pending buffer must be empty after flush",
+			"coalesce buffer must be empty after flush",
 		);
 		// Verify the message payload shape round-trips correctly.
 		const call = pi.calls[0] as { msg: { customType: string; display: boolean } };
@@ -253,8 +293,9 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 		const state = makeState(); // run unknown → stale initially
 		const visible = store[visibleControlNoticesStoreKey] as Set<string>;
 		const pi = makeFakePi();
+		(store as { __piSubagentLastPi?: unknown }).__piSubagentLastPi = pi;
 
-		// First arrival: stale drop.
+		// First arrival: sync-flush (window=0) drops it as stale.
 		processControlEvent(makePayload("run-reappears"), store, state, visible);
 		assert.equal(store[__piSubagentDroppedStaleNotices], 1, "first drop should increment counter");
 		assert.equal(visible.size, 0, "dedup set must be untouched after stale drop");
@@ -262,8 +303,16 @@ describe("control-notice receiver gate + delivery-time deferral", () => {
 		// Run becomes live.
 		(state.foregroundControls as Map<string, unknown>).set("run-reappears", { runId: "run-reappears" });
 
-		// Second arrival: now live — should go to pending buffer.
-		processControlEvent(makePayload("run-reappears"), store, state, visible);
+		// Second arrival: live, buffered.
+		processControlEvent(
+			{
+				event: buildControlEvent({ to: "stuck", runId: "run-reappears", agent: "test-agent", ts: Date.now() + 2000 }),
+				coalesceWindowMs: 1000,
+			},
+			store,
+			state,
+			visible,
+		);
 
 		// Flush while still live → must deliver.
 		flushPendingNotices(pi, store, state);

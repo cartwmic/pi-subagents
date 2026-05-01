@@ -75,7 +75,15 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					continue;
 				}
 				if (!parsed || typeof parsed !== "object" || (parsed as { type?: unknown }).type !== "subagent.control") continue;
-				const record = parsed as { event?: ControlEvent; channels?: string[]; childIntercomTarget?: string; noticeText?: string; intercom?: { to?: string; message?: string } };
+				const record = parsed as {
+					event?: ControlEvent;
+					channels?: string[];
+					childIntercomTarget?: string;
+					noticeText?: string;
+					intercom?: { to?: string; message?: string };
+					needsAttentionAfterMs?: number;
+					coalesceWindowMs?: number;
+				};
 				if (!record.event || !Array.isArray(record.channels)) continue;
 				const payload = {
 					event: record.event,
@@ -83,6 +91,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					asyncDir: job.asyncDir,
 					childIntercomTarget: record.childIntercomTarget,
 					noticeText: record.noticeText ?? formatControlNoticeMessage(record.event, record.childIntercomTarget),
+					// Section 3.4 (improve-control-notice-tuning): forward whatever
+					// the runner wrote (older runs omit these; receiver falls back to
+					// loadConfig() per task 3.6).
+					needsAttentionAfterMs: record.needsAttentionAfterMs,
+					coalesceWindowMs: record.coalesceWindowMs,
 				};
 				// Layer B gate (Section 6): drop replayed events for runs that have
 				// already terminated. The async tracker reads events.jsonl after the

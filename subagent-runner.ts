@@ -24,6 +24,7 @@ import {
 	buildControlEvent,
 	deriveActivityState,
 	claimControlNotification,
+	controlNotificationKeyFor,
 	formatControlIntercomMessage,
 	formatControlNoticeMessage,
 	shouldEmitControlEvent,
@@ -899,6 +900,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			channels: controlConfig.notifyChannels,
 			childIntercomTarget,
 			noticeText: formatControlNoticeMessage(event, childIntercomTarget),
+			// Section 3.4 (improve-control-notice-tuning): persist resolved tuning
+			// so async-job-tracker.ts replay forwards them in the bus payload.
+			needsAttentionAfterMs: controlConfig.needsAttentionAfterMs,
+			coalesceWindowMs: controlConfig.coalesceWindowMs,
 			...(config.controlIntercomTarget && controlConfig.notifyChannels.includes("intercom") ? {
 				intercom: {
 					to: config.controlIntercomTarget,
@@ -938,6 +943,21 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				lastActivityAt,
 			});
 			appendControlEvent(event);
+		} else if (previous === "needs_attention" && next === undefined) {
+			// improve-control-notice-tuning Section 9b.2: clear emitter dedup on
+			// recovery (mirror of execution.ts) so re-stalls can re-emit.
+			//
+			// subagent-runner.ts's claimControlNotification call site DOES pass
+			// childIntercomTarget (4-arg call at line ~895), so the recovery key
+			// must include it to match.
+			const childIntercomTarget = config.childIntercomTargets?.[statusPayload.currentStep];
+			const recoveryKey = controlNotificationKeyFor(
+				id,
+				statusPayload.currentStep,
+				"needs_attention",
+				childIntercomTarget,
+			);
+			emittedControlEventKeys.delete(recoveryKey);
 		}
 		writeJson(statusPath, statusPayload);
 		return true;
