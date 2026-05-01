@@ -198,6 +198,11 @@ function emitControlNotification(input: {
 		source: "foreground" as const,
 		childIntercomTarget,
 		noticeText: formatControlNoticeMessage(input.event, childIntercomTarget),
+		// Section 3.4 (improve-control-notice-tuning): forward resolved tuning
+		// parameters so the receiver-side coalesce buffer can capture them at
+		// the first event for this runId.
+		needsAttentionAfterMs: input.controlConfig.needsAttentionAfterMs,
+		coalesceWindowMs: input.controlConfig.coalesceWindowMs,
 	};
 	if (input.controlConfig.notifyChannels.includes("event")) {
 		// Layer B gate (Section 6): drop emits for runs that have gone stale

@@ -48,6 +48,9 @@ describe("subagent control attention state", () => {
 			agent: "worker",
 			index: 2,
 			message: "worker needs attention (no observed activity for 0s)",
+			// improve-control-notice-tuning Section 3.1/3.2: structured timing
+			lastActivityAt: 100,
+			elapsedMs: 900,
 		});
 	});
 

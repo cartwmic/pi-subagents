@@ -857,6 +857,57 @@ stdin is a JSON object with `repoRoot`, `worktreePath`, `agentCwd`, `branch`, `i
 
 `syntheticPaths` must be relative to the worktree root. They are removed before diff capture so helper files do not pollute patches. Tracked files are never excluded; marking a tracked path as synthetic fails setup. Default timeout is `30000` ms.
 
+## Tuning the watchdog
+
+pi-subagents emits `needs_attention` control notices when a child run shows no observed activity for a configurable window. The defaults are tuned for modern reasoning models that may legitimately think for a couple of minutes between tool calls; the surface is fully overridable per call or globally.
+
+### `needsAttentionAfterMs`
+
+No-observed-activity window before a run is flagged. **Default: `180000` (3 minutes).** Restoring the prior 60-second behavior:
+
+```jsonc
+{
+  "control": {
+    "needsAttentionAfterMs": 60000
+  }
+}
+```
+
+Per-call override:
+
+```jsonc
+subagent({
+  agent: "reviewer",
+  task: "...",
+  control: { "needsAttentionAfterMs": 30000 }
+})
+```
+
+### `coalesceWindowMs`
+
+Per-runId coalesce window in milliseconds. Within this window after the first `needs_attention` event for a run, additional events are buffered and delivered as a single multi-step notice. **Default: `1000`.** Set to `0` to disable coalescing (each event still routes through the liveness gate at flush time). Negative or non-integer values fall back to the default.
+
+A 6-way parallel review run that stalls simultaneously will produce **one** coalesced notice with per-step bullets, instead of six near-identical notifications:
+
+```
+⚠ Subagent needs attention: run abc123 (6 steps)
+6 steps stalled (>~180s no activity):
+  - step 1 (reviewer-a): no activity for 184s
+  - step 2 (reviewer-b): no activity for 191s
+  ...
+Status: subagent({ action: "status", id: "abc123" })
+Interrupt: subagent({ action: "interrupt", id: "abc123" })
+Action: this run has no intercom; if it's stuck, use Interrupt above.
+```
+
+### `notifyOn`
+
+Control event types that should notify the parent. Default: `["needs_attention"]` (currently the only supported type).
+
+### `notifyChannels`
+
+Notification channels to use when available. Default: `["event", "async", "intercom"]`. The `event` channel covers the in-process event bus; `async` writes to the per-run `events.jsonl`; `intercom` integrates with `pi-intercom` if installed.
+
 ## Files, logs, and observability
 
 Each chain run creates a user-scoped temp directory like:

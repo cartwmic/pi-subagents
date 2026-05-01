@@ -25,7 +25,11 @@ import { renderWidget, renderSubagentResult, stopResultAnimations, stopWidgetAni
 import { SubagentParams } from "./schemas.ts";
 import { createSubagentExecutor } from "./subagent-executor.ts";
 import { createAsyncJobTracker } from "./async-job-tracker.ts";
-import { controlNotificationKey, formatControlNoticeMessage } from "./subagent-control.ts";
+import {
+	DEFAULT_CONTROL_CONFIG,
+	formatCoalescedControlNoticeMessage,
+	formatControlNoticeMessage,
+} from "./subagent-control.ts";
 import { createResultWatcher } from "./result-watcher.ts";
 import { registerSlashCommands } from "./slash-commands.ts";
 import { registerPromptTemplateDelegationBridge } from "./prompt-template-bridge.ts";
@@ -158,6 +162,18 @@ interface SubagentControlMessageDetails {
 	asyncDir?: string;
 	childIntercomTarget?: string;
 	noticeText?: string;
+	/**
+	 * Multi-step coalesced events for the same runId. Populated at flush time
+	 * by the receiver-side coalesce buffer when more than one notice for the
+	 * same runId arrived within `coalesceWindowMs`. The renderer reads this
+	 * to switch to the run-level header. Optional / additive (single-event
+	 * notices leave it undefined).
+	 */
+	events?: ControlEvent[];
+	/** Threshold captured at first event in the coalesce buffer. */
+	needsAttentionAfterMs?: number;
+	/** Window captured at first event in the coalesce buffer. */
+	coalesceWindowMs?: number;
 }
 
 function controlNoticeTarget(details: SubagentControlMessageDetails): string | undefined {
@@ -218,7 +234,12 @@ class SubagentControlNoticeComponent implements Component {
 		if (width < 3) return [truncateToWidth(`Subagent ${eventLabel}`, width)];
 		const bodyWidth = Math.max(1, Math.min(width - 2, 68));
 		const borderChar = "─";
-		const header = ` ⚠ Subagent ${eventLabel}: ${this.details.event.agent} `;
+		// Multi-step coalesced notice: render the run-level header. Single-event
+		// notices keep the per-agent header for backward visual compatibility.
+		const events = this.details.events;
+		const header = events && events.length > 1
+			? ` ⚠ Subagent ${eventLabel}: run ${this.details.event.runId} (${events.length} steps) `
+			: ` ⚠ Subagent ${eventLabel}: ${this.details.event.agent} `;
 		const headerText = truncateToWidth(header, bodyWidth, "");
 		const headerPadding = Math.max(0, bodyWidth - visibleWidth(headerText));
 		const lines = [this.theme.fg("accent", `╭${headerText}${borderChar.repeat(headerPadding)}╮`)];
@@ -237,115 +258,300 @@ class SubagentControlNoticeComponent implements Component {
 const __piSubagentRecentlyTerminalRuns = "__piSubagentRecentlyTerminalRuns";
 const __piSubagentDroppedStaleNotices = "__piSubagentDroppedStaleNotices";
 const __piSubagentDedupedNotices = "__piSubagentDedupedNotices";
-const __piSubagentPendingNotices = "__piSubagentPendingNotices";
 const __piSubagentSweepTimer = "__piSubagentSweepTimer";
 const __piSubagentFlushFallbackTimer = "__piSubagentFlushFallbackTimer";
+// improve-control-notice-tuning Section 4: per-runId coalesce buffer (subsumes
+// change-1's __piSubagentPendingNotices). Keys live alongside change-1's keys
+// so reload cleanup can clear both.
+const __piSubagentControlNoticeBuffers = "__piSubagentControlNoticeBuffers";
+const __piSubagentDroppedCoalesceOverflow = "__piSubagentDroppedCoalesceOverflow";
+const __piSubagentSyncFlushDedup = "__piSubagentSyncFlushDedup";
+const __piSubagentRunFlushEpoch = "__piSubagentRunFlushEpoch";
+const __piSubagentLastPi = "__piSubagentLastPi";
 // Key for the dedup set — defined at module level so flushPendingNotices can use it.
 export const visibleControlNoticesStoreKey = "__piSubagentVisibleControlNotices";
 // ────────────────────────────────────────────────────────────────────────────
 
-/** Shape of an entry in the pending-notices buffer. */
-export interface PendingNoticeEntry {
-	arrivedAt: number;
-	payload: SubagentControlMessageDetails;
-	runId: string;
-	noticeText: string;
+/** Coalesce-buffer cap: per-runId events; overflow is counted and dropped. */
+const COALESCE_BUFFER_MAX = 100;
+/** Sync-flush (coalesceWindowMs===0) dedup window for cross-source same-key. */
+const SYNC_DEDUP_WINDOW_MS = 1000;
+/** Sync-flush dedup map sweep cadence — evicts entries older than 30s. */
+const SYNC_DEDUP_TTL_MS = 30_000;
+
+export interface CoalesceBufferEvent {
+	event: ControlEvent;
+	noticeText?: string;
+	source?: "foreground" | "async";
+	asyncDir?: string;
+}
+
+export interface CoalesceBufferEntry {
+	events: CoalesceBufferEvent[];
+	flushTimer?: NodeJS.Timeout;
+	openedAt: number;
+	needsAttentionAfterMs: number;
+	coalesceWindowMs: number;
+	childIntercomTargets: Map<number, string>;
+	dedupKeys: Set<string>;
+}
+
+function getOrInitMap<V>(
+	globalStore: Record<string, unknown>,
+	key: string,
+): Map<string, V> {
+	const existing = globalStore[key];
+	if (existing instanceof Map) return existing as Map<string, V>;
+	const map = new Map<string, V>();
+	globalStore[key] = map;
+	return map;
+}
+
+function resolveCoalesceWindowMsFromPayload(payloadValue: unknown): number {
+	if (
+		typeof payloadValue === "number" &&
+		Number.isFinite(payloadValue) &&
+		Number.isInteger(payloadValue) &&
+		payloadValue >= 0
+	) {
+		return payloadValue;
+	}
+	return DEFAULT_CONTROL_CONFIG.coalesceWindowMs;
+}
+
+function resolveNeedsAttentionAfterMsFromPayload(payloadValue: unknown): number {
+	if (
+		typeof payloadValue === "number" &&
+		Number.isFinite(payloadValue) &&
+		Number.isInteger(payloadValue) &&
+		payloadValue >= 1
+	) {
+		return payloadValue;
+	}
+	return DEFAULT_CONTROL_CONFIG.needsAttentionAfterMs;
 }
 
 /**
- * Process an incoming SUBAGENT_CONTROL_EVENT through the liveness gate.
+ * Process an incoming SUBAGENT_CONTROL_EVENT into the per-runId coalesce buffer.
  *
- * - Stale run  → increment droppedStaleNotices, return (DO NOT touch dedup set).
- * - Already deduped → increment dedupedNotices, return.
- * - Live, new  → write entry into the pending-notices buffer for flush-time re-check.
+ * For `coalesceWindowMs > 0` (default 1000ms), buffers events for the same
+ * runId and schedules a single flush via setTimeout. For `coalesceWindowMs === 0`,
+ * flushes synchronously and uses a separate cross-source dedup map
+ * (SYNC_DEDUP_WINDOW_MS = 1000ms) to absorb the live-bus + async-tracker
+ * disk-replay double-emit case.
  *
- * Exported for unit tests; also used as the closure body of controlEventHandler.
+ * Liveness re-checking happens at flush time (per change-1's contract).
  */
 export function processControlEvent(
 	payload: unknown,
 	globalStore: Record<string, unknown>,
 	state: SubagentState,
-	visibleControlNotices: Set<string>,
+	_visibleControlNotices: Set<string>,
 ): void {
 	const details = payload as SubagentControlMessageDetails;
 	if (!details?.event) return;
+	const event = details.event;
+	const runId = event.runId;
 	const childIntercomTarget = controlNoticeTarget(details);
-	const key = controlNotificationKey(details.event, childIntercomTarget);
 
-	// Layer C gate: re-check liveness before even buffering.
-	if (classifyRunForNotice(state, details.event.runId) === "stale") {
-		globalStore[__piSubagentDroppedStaleNotices] =
-			((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) + 1;
-		// DO NOT add key to visibleControlNotices (Decision 6 / no-poisoning rule).
-		return;
+	const dedupKey = `${runId}:${event.index ?? "none"}:${event.type}`;
+	const coalesceWindowMs = resolveCoalesceWindowMsFromPayload(
+		(details as { coalesceWindowMs?: unknown }).coalesceWindowMs,
+	);
+
+	// coalesceWindowMs === 0: sync-flush path. Cross-source dedup via a
+	// time-windowed map separate from per-runId buffer dedupKeys.
+	if (coalesceWindowMs === 0) {
+		const syncMap = getOrInitMap<number>(globalStore, __piSubagentSyncFlushDedup);
+		const lastSeenAt = syncMap.get(dedupKey);
+		if (lastSeenAt !== undefined && event.ts - lastSeenAt < SYNC_DEDUP_WINDOW_MS) {
+			globalStore[__piSubagentDedupedNotices] =
+				((globalStore[__piSubagentDedupedNotices] as number) ?? 0) + 1;
+			return;
+		}
+		syncMap.set(dedupKey, event.ts);
 	}
 
-	// Dedup check.
-	if (visibleControlNotices.has(key)) {
+	const buffers = getOrInitMap<CoalesceBufferEntry>(globalStore, __piSubagentControlNoticeBuffers);
+	let buffer = buffers.get(runId);
+	if (!buffer) {
+		buffer = {
+			events: [],
+			openedAt: Date.now(),
+			needsAttentionAfterMs: resolveNeedsAttentionAfterMsFromPayload(
+				(details as { needsAttentionAfterMs?: unknown }).needsAttentionAfterMs,
+			),
+			coalesceWindowMs,
+			childIntercomTargets: new Map(),
+			dedupKeys: new Set(),
+		};
+		buffers.set(runId, buffer);
+	}
+
+	// Within-buffer dedup (live + async-tracker disk replay produce same key).
+	if (buffer.dedupKeys.has(dedupKey)) {
 		globalStore[__piSubagentDedupedNotices] =
 			((globalStore[__piSubagentDedupedNotices] as number) ?? 0) + 1;
 		return;
 	}
 
-	// Write to pending buffer — delivery (and dedup-set update) happens at flush time.
-	const noticeText =
-		details.noticeText ?? formatControlNoticeMessage(details.event, childIntercomTarget);
-	const pending = globalStore[__piSubagentPendingNotices] as Map<string, PendingNoticeEntry>;
-	pending.set(key, {
-		arrivedAt: Date.now(),
-		payload: { ...details, childIntercomTarget, noticeText },
-		runId: details.event.runId,
-		noticeText,
+	if (buffer.events.length >= COALESCE_BUFFER_MAX) {
+		globalStore[__piSubagentDroppedCoalesceOverflow] =
+			((globalStore[__piSubagentDroppedCoalesceOverflow] as number) ?? 0) + 1;
+		return;
+	}
+
+	buffer.events.push({
+		event,
+		noticeText: details.noticeText,
+		source: details.source,
+		asyncDir: details.asyncDir,
 	});
+	buffer.dedupKeys.add(dedupKey);
+	if (childIntercomTarget !== undefined) {
+		buffer.childIntercomTargets.set(event.index ?? 0, childIntercomTarget);
+	}
+
+	if (coalesceWindowMs === 0) {
+		// Sync flush: skip the timer; flush immediately.
+		flushControlNoticeBuffer(runId, globalStore, state);
+		return;
+	}
+
+	// Schedule a flush on first event for this runId.
+	if (!buffer.flushTimer) {
+		const timer = setTimeout(() => {
+			flushControlNoticeBuffer(runId, globalStore, state);
+		}, coalesceWindowMs);
+		timer.unref?.();
+		buffer.flushTimer = timer;
+	}
 }
 
 /**
- * Flush all pending control notices, re-checking liveness at delivery time.
+ * Flush a single per-runId coalesce buffer. Reads `pi` from
+ * `globalStore.__piSubagentLastPi` (or the override). Re-checks liveness per
+ * event and drops stale entries. Uses a per-runId epoch so re-stalls after
+ * recovery publish cleanly.
  *
- * - Live at flush  → pi.sendMessage, add key to dedup set, remove from buffer.
- * - Stale at flush → increment droppedStaleNotices, remove from buffer.
- * - Older than 60s → same as stale (TTL safety).
+ * Exported for tests; the timer in `processControlEvent` calls this directly.
+ */
+export function flushControlNoticeBuffer(
+	runId: string,
+	globalStore: Record<string, unknown>,
+	state: SubagentState,
+	piOverride?: { sendMessage(msg: unknown, opts: unknown): void },
+): void {
+	const buffers = globalStore[__piSubagentControlNoticeBuffers] as
+		| Map<string, CoalesceBufferEntry>
+		| undefined;
+	if (!buffers) return;
+	const buffer = buffers.get(runId);
+	if (!buffer) return;
+	buffers.delete(runId);
+	if (buffer.flushTimer) clearTimeout(buffer.flushTimer);
+
+	const pi =
+		piOverride ??
+		(globalStore[__piSubagentLastPi] as { sendMessage(msg: unknown, opts: unknown): void } | undefined);
+	if (!pi) return;
+
+	// Per-buffer liveness gate. All events in the buffer share the same runId
+	// (the buffer is keyed by runId), so the classification is constant for the
+	// whole batch. We still increment droppedStaleNotices by the per-event
+	// count so operators get a true rate signal.
+	const liveness = classifyRunForNotice(state, runId);
+	if (liveness === "stale") {
+		globalStore[__piSubagentDroppedStaleNotices] =
+			((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) +
+			buffer.events.length;
+		return;
+	}
+	const liveEvents: CoalesceBufferEvent[] = buffer.events;
+
+	// Per-runId epoch: advances on every successful publish so a re-stall on
+	// the same key after recovery still publishes (paired with emitter-side
+	// dedup recovery clear in execution.ts / subagent-runner.ts).
+	const epochMap = getOrInitMap<number>(globalStore, __piSubagentRunFlushEpoch);
+	const epoch = epochMap.get(runId) ?? 0;
+	const flushKey = `${runId}:epoch-${epoch}`;
+	const visible = globalStore[visibleControlNoticesStoreKey] as Set<string> | undefined;
+	if (visible?.has(flushKey)) return; // double-flush guard
+
+	// Build content + details.
+	let content: string;
+	if (liveEvents.length === 1) {
+		const single = liveEvents[0]!;
+		content =
+			single.noticeText ??
+			formatControlNoticeMessage(
+				single.event,
+				buffer.childIntercomTargets.get(single.event.index ?? 0),
+			);
+	} else {
+		content = formatCoalescedControlNoticeMessage(
+			liveEvents.map((entry) => entry.event),
+			buffer.childIntercomTargets,
+			buffer.needsAttentionAfterMs,
+		);
+	}
+
+	const firstEntry = liveEvents[0]!;
+	const details: SubagentControlMessageDetails = {
+		event: firstEntry.event,
+		source: firstEntry.source,
+		asyncDir: firstEntry.asyncDir,
+		childIntercomTarget: buffer.childIntercomTargets.get(firstEntry.event.index ?? 0),
+		events: liveEvents.map((entry) => entry.event),
+		noticeText: content,
+		needsAttentionAfterMs: buffer.needsAttentionAfterMs,
+		coalesceWindowMs: buffer.coalesceWindowMs,
+	};
+
+	if (visible) visible.add(flushKey);
+	epochMap.set(runId, epoch + 1);
+
+	pi.sendMessage(
+		{
+			customType: SUBAGENT_CONTROL_MESSAGE_TYPE,
+			content,
+			display: true,
+			details,
+		},
+		{ triggerTurn: true },
+	);
+}
+
+/**
+ * Legacy compatibility shim: flush every pending coalesce buffer.
  *
- * Exported for unit tests and wired as a flush trigger.
+ * Called by the existing `pi.on("tool_result")` listener and the 5s fallback
+ * timer (both wired in change-1). Iterates each buffered runId and calls
+ * `flushControlNoticeBuffer`.
  */
 export function flushPendingNotices(
 	pi: { sendMessage(msg: unknown, opts: unknown): void },
 	globalStore: Record<string, unknown>,
 	state: SubagentState,
 ): void {
-	const pending = globalStore[__piSubagentPendingNotices] as Map<string, PendingNoticeEntry>;
-	if (!pending || pending.size === 0) return;
-	const visible = globalStore[visibleControlNoticesStoreKey] as Set<string>;
-	const now = Date.now();
-	const keysToDelete: string[] = [];
-	for (const [key, entry] of pending) {
-		// Optional pending-buffer TTL safety (60s).
-		if (now - entry.arrivedAt > 60_000) {
-			globalStore[__piSubagentDroppedStaleNotices] =
-				((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) + 1;
-			keysToDelete.push(key);
-			continue;
-		}
-		const liveness = classifyRunForNotice(state, entry.runId);
-		if (liveness === "live") {
-			pi.sendMessage(
-				{
-					customType: SUBAGENT_CONTROL_MESSAGE_TYPE,
-					content: entry.noticeText,
-					display: true,
-					details: entry.payload,
-				},
-				{ triggerTurn: true },
-			);
-			visible.add(key);
-			keysToDelete.push(key);
-		} else {
-			globalStore[__piSubagentDroppedStaleNotices] =
-				((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) + 1;
-			keysToDelete.push(key);
-		}
+	const buffers = globalStore[__piSubagentControlNoticeBuffers] as
+		| Map<string, CoalesceBufferEntry>
+		| undefined;
+	if (!buffers || buffers.size === 0) return;
+	// Snapshot keys; flushControlNoticeBuffer mutates the map.
+	for (const runId of Array.from(buffers.keys())) {
+		flushControlNoticeBuffer(runId, globalStore, state, pi);
 	}
-	for (const k of keysToDelete) pending.delete(k);
+}
+
+/** Sweep stale entries from the sync-flush dedup map. */
+function sweepSyncFlushDedup(globalStore: Record<string, unknown>, now: number = Date.now()): void {
+	const map = globalStore[__piSubagentSyncFlushDedup];
+	if (!(map instanceof Map)) return;
+	const cutoff = now - SYNC_DEDUP_TTL_MS;
+	for (const [key, lastSeenAt] of map as Map<string, number>) {
+		if (lastSeenAt < cutoff) map.delete(key);
+	}
 }
 
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
@@ -364,14 +570,25 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	if (!(globalStore[__piSubagentRecentlyTerminalRuns] instanceof Map)) {
 		globalStore[__piSubagentRecentlyTerminalRuns] = new Map();
 	}
-	if (!(globalStore[__piSubagentPendingNotices] instanceof Map)) {
-		globalStore[__piSubagentPendingNotices] = new Map();
+	// improve-control-notice-tuning Section 4: replace pending-notices buffer
+	// with the per-runId coalesce buffer + supporting maps.
+	if (!(globalStore[__piSubagentControlNoticeBuffers] instanceof Map)) {
+		globalStore[__piSubagentControlNoticeBuffers] = new Map();
+	}
+	if (!(globalStore[__piSubagentSyncFlushDedup] instanceof Map)) {
+		globalStore[__piSubagentSyncFlushDedup] = new Map();
+	}
+	if (!(globalStore[__piSubagentRunFlushEpoch] instanceof Map)) {
+		globalStore[__piSubagentRunFlushEpoch] = new Map();
 	}
 	if (typeof globalStore[__piSubagentDroppedStaleNotices] !== "number") {
 		globalStore[__piSubagentDroppedStaleNotices] = 0;
 	}
 	if (typeof globalStore[__piSubagentDedupedNotices] !== "number") {
 		globalStore[__piSubagentDedupedNotices] = 0;
+	}
+	if (typeof globalStore[__piSubagentDroppedCoalesceOverflow] !== "number") {
+		globalStore[__piSubagentDroppedCoalesceOverflow] = 0;
 	}
 	// __piSubagentSweepTimer and __piSubagentFlushFallbackTimer are left
 	// undefined here; Section 7 (timer install/cleanup) owns their lifecycle.
@@ -418,16 +635,27 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	let flushToolResultUnsub: (() => void) | undefined;
 
 	const runtimeCleanup = () => {
-		// Drop all pending notices without flushing (Decision 8: stale pi on reload).
-		const pendingOnCleanup = globalStore[__piSubagentPendingNotices] as
-			| Map<string, PendingNoticeEntry>
+		// improve-control-notice-tuning Section 9.1: drop coalesce buffers without
+		// flushing (stale pi on reload — calling pi.sendMessage from a torn-down
+		// pi is undefined behavior). Clear timers first so they can't fire.
+		const buffersOnCleanup = globalStore[__piSubagentControlNoticeBuffers] as
+			| Map<string, CoalesceBufferEntry>
 			| undefined;
-		if (pendingOnCleanup && pendingOnCleanup.size > 0) {
+		if (buffersOnCleanup && buffersOnCleanup.size > 0) {
+			let droppedEvents = 0;
+			for (const buffer of buffersOnCleanup.values()) {
+				if (buffer.flushTimer) clearTimeout(buffer.flushTimer);
+				droppedEvents += buffer.events.length;
+			}
 			globalStore[__piSubagentDroppedStaleNotices] =
 				((globalStore[__piSubagentDroppedStaleNotices] as number) ?? 0) +
-				pendingOnCleanup.size;
-			pendingOnCleanup.clear();
+				droppedEvents;
+			buffersOnCleanup.clear();
 		}
+		// `__piSubagentLastPi` is the prior registration's pi reference. Unset it
+		// so any stale closure that wakes between cleanup and re-registration
+		// finds no pi and bails (flushControlNoticeBuffer's defensive `if (!pi)`).
+		globalStore[__piSubagentLastPi] = undefined;
 		// Section 7: clear sweep timer in addition to existing cleanup.
 		if (globalStore[__piSubagentSweepTimer]) {
 			clearInterval(globalStore[__piSubagentSweepTimer] as NodeJS.Timeout);
@@ -508,6 +736,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		const content = typeof message.content === "string" ? message.content : undefined;
 		return new SubagentControlNoticeComponent({ ...details, noticeText: formatSubagentControlNotice(details, content) }, theme);
 	});
+
+	// improve-control-notice-tuning Section 9.2: set the lastPi reference
+	// AFTER previousRuntimeCleanup() has run AND AFTER the renderer is
+	// registered. Coalesce-buffer flushes will resolve `pi` from this slot.
+	globalStore[__piSubagentLastPi] = pi;
 
 	const slashBridge = registerSlashSubagentBridge({
 		events: pi.events,
@@ -689,6 +922,8 @@ DIAGNOSTICS:
 	}
 	const sweepTimer = setInterval(() => {
 		sweepRecentTerminalRuns(globalStore);
+		// improve-control-notice-tuning: also sweep the sync-flush dedup map.
+		sweepSyncFlushDedup(globalStore);
 	}, 60_000);
 	sweepTimer.unref();
 	globalStore[__piSubagentSweepTimer] = sweepTimer;
@@ -763,6 +998,23 @@ DIAGNOSTICS:
 		promptTemplateBridge.dispose();
 		stopWidgetAnimation();
 		stopResultAnimations();
+		// improve-control-notice-tuning Section 9.3: clear all tuning state on
+		// shutdown so pending flush timers cannot fire post-shutdown and no
+		// ghost notices are emitted.
+		const buffersOnShutdown = globalStore[__piSubagentControlNoticeBuffers] as
+			| Map<string, CoalesceBufferEntry>
+			| undefined;
+		if (buffersOnShutdown) {
+			for (const buffer of buffersOnShutdown.values()) {
+				if (buffer.flushTimer) clearTimeout(buffer.flushTimer);
+			}
+			buffersOnShutdown.clear();
+		}
+		const syncDedup = globalStore[__piSubagentSyncFlushDedup];
+		if (syncDedup instanceof Map) syncDedup.clear();
+		const flushEpoch = globalStore[__piSubagentRunFlushEpoch];
+		if (flushEpoch instanceof Map) flushEpoch.clear();
+		globalStore[__piSubagentLastPi] = undefined;
 		if (globalStore[runtimeCleanupStoreKey] === runtimeCleanup) {
 			delete globalStore[runtimeCleanupStoreKey];
 		}

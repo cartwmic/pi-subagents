@@ -168,20 +168,28 @@ function formatControlNoticeLines(input: DoctorReportInput): string[] {
 		return [
 			"- dropped stale notices: 0",
 			"- deduped notices: 0",
+			"- dropped coalesce overflow: 0",
 			"- recently-terminal runs: 0 (oldest: (empty))",
 			"- pending notices: 0",
 		];
 	}
 	const dropped = (store.__piSubagentDroppedStaleNotices as number) ?? 0;
 	const deduped = (store.__piSubagentDedupedNotices as number) ?? 0;
+	// improve-control-notice-tuning Section 10.1: surface coalesce overflow.
+	const overflow = (store.__piSubagentDroppedCoalesceOverflow as number) ?? 0;
 	const recentlyTerminal =
 		store.__piSubagentRecentlyTerminalRuns instanceof Map
 			? (store.__piSubagentRecentlyTerminalRuns as Map<string, RecentTerminalEntryShape>)
 			: new Map<string, RecentTerminalEntryShape>();
-	const pending =
-		store.__piSubagentPendingNotices instanceof Map
-			? (store.__piSubagentPendingNotices as Map<string, unknown>)
-			: new Map<string, unknown>();
+	// improve-control-notice-tuning: "pending notices" now sources from the
+	// per-runId coalesce buffer; fall back to the legacy pending-notices map
+	// for any straggler tests that still populate it directly.
+	const pendingMap =
+		store.__piSubagentControlNoticeBuffers instanceof Map
+			? (store.__piSubagentControlNoticeBuffers as Map<string, unknown>)
+			: store.__piSubagentPendingNotices instanceof Map
+				? (store.__piSubagentPendingNotices as Map<string, unknown>)
+				: new Map<string, unknown>();
 	let oldestAge: string;
 	if (recentlyTerminal.size === 0) {
 		oldestAge = "(empty)";
@@ -196,8 +204,9 @@ function formatControlNoticeLines(input: DoctorReportInput): string[] {
 	return [
 		`- dropped stale notices: ${dropped}`,
 		`- deduped notices: ${deduped}`,
+		`- dropped coalesce overflow: ${overflow}`,
 		`- recently-terminal runs: ${recentlyTerminal.size} (oldest: ${oldestAge})`,
-		`- pending notices: ${pending.size}`,
+		`- pending notices: ${pendingMap.size}`,
 	];
 }
 

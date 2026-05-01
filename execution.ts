@@ -30,6 +30,7 @@ import {
 	DEFAULT_CONTROL_CONFIG,
 	buildControlEvent,
 	claimControlNotification,
+	controlNotificationKeyFor,
 	deriveActivityState,
 	shouldEmitControlEvent,
 	shouldNotifyControlEvent,
@@ -300,6 +301,22 @@ async function runSingleAttempt(
 					ts: now,
 					lastActivityAt: progress.lastActivityAt,
 				}));
+			} else if (previous === "needs_attention" && next === undefined) {
+				// improve-control-notice-tuning Section 9b.1: clear the emitter-side
+				// dedup key on recovery so a subsequent re-stall on the same
+				// (runId, index, type) emits a fresh event. Without this, the
+				// per-runId flush-epoch counter (Section 5) becomes dead code for
+				// stall → recover → re-stall cycles.
+				//
+				// execution.ts's claimControlNotification call site does NOT pass a
+				// childIntercomTarget (it's a 3-arg call), so the recovery key
+				// must also omit the target to match.
+				const recoveryKey = controlNotificationKeyFor(
+					options.runId,
+					options.index,
+					"needs_attention",
+				);
+				emittedControlEventKeys.delete(recoveryKey);
 			}
 			return true;
 		};

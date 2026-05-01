@@ -41,25 +41,27 @@ const buildDoctorReport = doctorMod?.buildDoctorReport;
 const recentTerminalMod = await tryImport<any>("./recent-terminal.ts");
 const recordTerminalRun = recentTerminalMod?.recordTerminalRun;
 
-// Reset module-level / globalThis state between tests.
+// improve-control-notice-tuning Section 4: pending-notices buffer replaced by
+// per-runId coalesce buffer (__piSubagentControlNoticeBuffers).
 const STORE_KEYS = [
 	"__piSubagentRecentlyTerminalRuns",
 	"__piSubagentDroppedStaleNotices",
 	"__piSubagentDedupedNotices",
-	"__piSubagentPendingNotices",
+	"__piSubagentControlNoticeBuffers",
+	"__piSubagentSyncFlushDedup",
+	"__piSubagentRunFlushEpoch",
 	"__piSubagentVisibleControlNotices",
 ];
 
 function freshGlobalStore(): Record<string, unknown> {
 	const store: Record<string, unknown> = {};
 	store.__piSubagentRecentlyTerminalRuns = new Map();
-	store.__piSubagentPendingNotices = new Map();
+	store.__piSubagentControlNoticeBuffers = new Map();
+	store.__piSubagentSyncFlushDedup = new Map();
+	store.__piSubagentRunFlushEpoch = new Map();
 	store.__piSubagentDroppedStaleNotices = 0;
 	store.__piSubagentDedupedNotices = 0;
 	store.__piSubagentVisibleControlNotices = new Set<string>();
-	// Mirror onto globalThis so the module-scope alias used by helpers
-	// (recordTerminalRun pulls from a fresh getMap call rooted at this store)
-	// can co-exist; we pass the local store explicitly to all entrypoints.
 	for (const key of STORE_KEYS) (globalThis as any)[key] = store[key];
 	return store;
 }
@@ -91,7 +93,7 @@ function makePiStub() {
 	};
 }
 
-function makeNoticePayload(runId: string, agent = "test-agent", index?: number) {
+function makeNoticePayload(runId: string, agent = "test-agent", index?: number, opts: { coalesceWindowMs?: number } = {}) {
 	return {
 		event: {
 			type: "needs_attention",
@@ -104,6 +106,9 @@ function makeNoticePayload(runId: string, agent = "test-agent", index?: number) 
 		},
 		source: "foreground",
 		noticeText: `notice for ${runId}`,
+		// Default to a long window so events are buffered (not sync-flushed) for
+		// these tests; individual tests override to 0 when sync flush is desired.
+		coalesceWindowMs: opts.coalesceWindowMs ?? 1000,
 	};
 }
 
@@ -129,30 +134,34 @@ describe("control-notice liveness gate — receiver-side + delivery-time", () =>
 
 		processControlEvent(makeNoticePayload(runId), store, state, visible);
 
-		const pending = store.__piSubagentPendingNotices as Map<string, unknown>;
-		assert.equal(pending.size, 1, "live notice should be buffered");
+		const buffers = store.__piSubagentControlNoticeBuffers as Map<string, { events: unknown[] }>;
+		assert.equal(buffers.size, 1, "coalesce buffer should hold one runId");
+		assert.equal(buffers.get(runId)?.events.length, 1, "buffer should hold one event");
 		assert.equal(pi.sent.length, 0, "live notice should NOT sendMessage yet");
 		assert.equal(visible.size, 0, "dedup set should NOT be touched at receive time");
 	});
 
 	it("10.1b drops a notice for an unknown run + increments droppedStaleNotices", () => {
-		processControlEvent(makeNoticePayload("ghost-run"), store, state, visible);
+		// Use sync-flush (window=0) so the gate runs immediately and the drop
+		// counter increments in this tick.
+		(store as { __piSubagentLastPi?: unknown }).__piSubagentLastPi = pi;
+		processControlEvent(makeNoticePayload("ghost-run", "test-agent", undefined, { coalesceWindowMs: 0 }), store, state, visible);
 
 		assert.equal(store.__piSubagentDroppedStaleNotices, 1);
-		const pending = store.__piSubagentPendingNotices as Map<string, unknown>;
-		assert.equal(pending.size, 0);
+		const buffers = store.__piSubagentControlNoticeBuffers as Map<string, unknown>;
+		assert.equal(buffers.size, 0, "coalesce buffer must be empty after sync flush of stale notice");
 		assert.equal(visible.size, 0, "dropped notice does NOT poison dedup");
 	});
 
 	it("11.3 (CRITICAL) — buffered-while-live, terminate before flush, drop at flush", () => {
 		const runId = "buffered-then-terminated";
-		// 1. Run is live; receiver buffers the notice.
+		// 1. Run is live; receiver buffers the notice (window=1000 so timer is set).
 		state.foregroundControls.set(runId, { runId } as never);
 		processControlEvent(makeNoticePayload(runId), store, state, visible);
-		assert.equal((store.__piSubagentPendingNotices as Map<string, unknown>).size, 1);
+		const buffers = store.__piSubagentControlNoticeBuffers as Map<string, { events: unknown[] }>;
+		assert.equal(buffers.get(runId)?.events.length, 1);
 
 		// 2. Run terminates: record terminal + delete from foregroundControls.
-		//    (Mimics the subagent-executor.ts finally block ordering.)
 		recordTerminalRun(store, runId, "succeeded");
 		state.foregroundControls.delete(runId);
 
@@ -162,8 +171,7 @@ describe("control-notice liveness gate — receiver-side + delivery-time", () =>
 		// 4. Assertions.
 		assert.equal(pi.sent.length, 0, "no sendMessage for the now-stale run");
 		assert.equal(store.__piSubagentDroppedStaleNotices, 1, "droppedStaleNotices += 1");
-		const pending = store.__piSubagentPendingNotices as Map<string, unknown>;
-		assert.equal(pending.size, 0, "buffer drained");
+		assert.equal(buffers.size, 0, "buffer drained");
 	});
 
 	it("11.3 happy-path counterpart — buffered-while-live, still live at flush, delivered", () => {
@@ -180,16 +188,43 @@ describe("control-notice liveness gate — receiver-side + delivery-time", () =>
 
 	it("10.4 dropped stale notice does NOT poison the dedup set (later live recurrence still publishes)", () => {
 		const runId = "key-recycle-run";
+		(store as { __piSubagentLastPi?: unknown }).__piSubagentLastPi = pi;
 
-		// (a) drop a stale notice with the key.
-		processControlEvent(makeNoticePayload(runId), store, state, visible);
+		// (a) sync-flush (window=0) drop a stale notice with the key.
+		processControlEvent(
+			makeNoticePayload(runId, "test-agent", undefined, { coalesceWindowMs: 0 }),
+			store,
+			state,
+			visible,
+		);
 		assert.equal(store.__piSubagentDroppedStaleNotices, 1);
 		assert.equal(visible.size, 0, "drop must not touch dedup set");
 
-		// (b) the run becomes live; same key arrives.
+		// (b) the run becomes live; same key arrives. Use sync-flush so it
+		// publishes on the spot. The per-runId epoch advances on publish, so
+		// future duplicates in the same window are still suppressed by the
+		// sync-dedup map; here we only assert the first one publishes.
 		state.foregroundControls.set(runId, { runId } as never);
-		processControlEvent(makeNoticePayload(runId), store, state, visible);
-		flushPendingNotices(pi, store, state);
+		// Bump ts past the SYNC_DEDUP_WINDOW_MS so the prior stale-drop ts
+		// doesn't suppress this one.
+		processControlEvent(
+			{
+				event: {
+					type: "needs_attention",
+					runId,
+					to: "stuck",
+					ts: Date.now() + 5000,
+					agent: "test-agent",
+					message: `notice for ${runId}`,
+				},
+				source: "foreground",
+				noticeText: `notice for ${runId}`,
+				coalesceWindowMs: 0,
+			},
+			store,
+			state,
+			visible,
+		);
 
 		assert.equal(pi.sent.length, 1, "live recurrence with same key publishes");
 	});
@@ -295,8 +330,18 @@ describe("control-notice liveness gate — doctor surface", () => {
 		const recently = store.__piSubagentRecentlyTerminalRuns as Map<string, unknown>;
 		recently.set("r1", { terminatedAt: Date.now() - 1234, terminalState: "succeeded" });
 		recently.set("r2", { terminatedAt: Date.now() - 500, terminalState: "failed" });
-		const pending = store.__piSubagentPendingNotices as Map<string, unknown>;
-		pending.set("k1", { arrivedAt: Date.now(), payload: {}, runId: "x", noticeText: "y" });
+		// improve-control-notice-tuning: doctor still reports a `pending notices`
+		// line; the source map is now `__piSubagentControlNoticeBuffers`. Add
+		// one buffered runId to assert the count.
+		const buffers = store.__piSubagentControlNoticeBuffers as Map<string, unknown>;
+		buffers.set("x", {
+			events: [{ event: { runId: "x" }, noticeText: "y" }],
+			openedAt: Date.now(),
+			needsAttentionAfterMs: 60_000,
+			coalesceWindowMs: 1000,
+			childIntercomTargets: new Map(),
+			dedupKeys: new Set(),
+		});
 
 		const state = makeState();
 		const report = buildDoctorReport({
@@ -326,6 +371,7 @@ describe("control-notice liveness gate — doctor surface", () => {
 		assert.match(report, /deduped notices: 3/);
 		assert.match(report, /recently-terminal runs: 2/);
 		assert.match(report, /pending notices: 1/);
+		assert.match(report, /dropped coalesce overflow: 0/);
 	});
 
 	it("10.5b doctor degrades gracefully when globalStore is absent", () => {

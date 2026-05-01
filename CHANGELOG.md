@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed (BREAKING-IN-DEFAULT)
+- `control.needsAttentionAfterMs` default raised from `60_000` to `180_000` (3 minutes). Modern reasoning models routinely think 60–180s between tool calls; the prior 60s default treated normal cognition as stuck. Restore the previous behavior with `control: { needsAttentionAfterMs: 60000 }` per call or in global config. (`improve-control-notice-tuning`)
+
+### Added
+- `control.coalesceWindowMs` configuration (default `1000`ms; `0` disables). Within this window after the first `needs_attention` event for a run, additional events for the same `runId` are buffered and delivered as a single multi-step notice. A 6-way parallel review run that stalls simultaneously now produces one coalesced notice with per-step bullets instead of six near-identical notifications. (`improve-control-notice-tuning`)
+- `ControlEvent.lastActivityAt` and `ControlEvent.elapsedMs` (optional, additive). Lets the multi-step formatter render accurate "no activity for Ns" lines per step without parsing the message string. Older readers ignore the unknown fields. (`improve-control-notice-tuning`)
+- Multi-step renderer header: `⚠ Subagent needs attention: run <runId> (<N> steps)` for coalesced notices; single-event notices keep the per-agent header. (`improve-control-notice-tuning`)
+- Doctor surface: "Control notices" section now reports `dropped coalesce overflow` count alongside the existing counters. (`improve-control-notice-tuning`)
+- README: new "Tuning the watchdog" section documenting `needsAttentionAfterMs`, `coalesceWindowMs`, `notifyOn`, `notifyChannels` with examples and migration snippet. (`improve-control-notice-tuning`)
+- SKILL.md: new "Reading control notices" subsection with guidance on `Interrupt` vs `Status:`, the coalesce window, multi-step notices, and recently-terminal lookups. (`improve-control-notice-tuning`)
+
+### Changed
+- Receiver-side notice flow now uses a per-`runId` coalesce buffer instead of the per-key pending buffer introduced in `fix-control-notice-liveness-gate`. Liveness re-checking remains at flush time (per-event). Internal renderer payload `SubagentControlMessageDetails` gains optional `events?: ControlEvent[]`, `needsAttentionAfterMs?`, and `coalesceWindowMs?`. (`improve-control-notice-tuning`)
+- Hint text for runs without an intercom target updated from `Nudge: no child message route registered` to `Action: this run has no intercom; if it's stuck, use Interrupt above.` Applied to both single-step and multi-step notices. (`improve-control-notice-tuning`)
+- Emitter-side dedup in `execution.ts` and `subagent-runner.ts` now clears its dedup key on the `needs_attention → undefined` recovery transition so a subsequent re-stall on the same `(runId, index, type)` re-emits cleanly. Pairs with the receiver's per-runId flush epoch. (`improve-control-notice-tuning`)
+
 ### Fixed
 - Subagent control notices for runs that completed during the parent's pending tool call are no longer surfaced as false-alarm "idle subagent" warnings. Notices are now buffered into a per-run pending queue and re-checked for liveness at flush time (`pi.on("tool_result")` + 5s fallback timer). Bus-emit gates added at all four emit sites; recently-terminal map plumbed through to consumers. (`fix-control-notice-liveness-gate`)
 

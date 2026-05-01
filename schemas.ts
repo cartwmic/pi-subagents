@@ -99,6 +99,10 @@ export const ControlOverrides = Type.Object({
 	notifyChannels: Type.Optional(Type.Array(Type.String({ enum: ["event", "async", "intercom"] }), {
 		description: "Notification channels to use when available. Defaults to event, async, and intercom.",
 	})),
+	coalesceWindowMs: Type.Optional(Type.Number({
+		minimum: 0,
+		description: "Per-runId coalesce window in milliseconds; 0 disables. Negative or non-integer falls back to default 1000.",
+	})),
 });
 
 export const SubagentParams = Type.Object({
