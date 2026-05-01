@@ -11,6 +11,7 @@ import { resolveExecutionAgentScope } from "./agent-scope.ts";
 import { handleManagementAction } from "./agent-management.ts";
 import { buildDoctorReport } from "./doctor.ts";
 import { runSync } from "./execution.ts";
+import { classifyRunForNotice } from "./liveness.ts";
 import { resolveModelCandidate } from "./model-fallback.ts";
 import { aggregateParallelOutputs } from "./parallel-utils.ts";
 import { recordRun } from "./run-history.ts";
@@ -40,6 +41,7 @@ import {
 	stripDetailsOutputsForIntercomReceipt,
 } from "./result-intercom.ts";
 import { inspectSubagentStatus } from "./run-status.ts";
+import { recordTerminalRun } from "./recent-terminal.ts";
 import { applyForceTopLevelAsyncOverride } from "./top-level-async.ts";
 import {
 	cleanupWorktrees,
@@ -75,6 +77,7 @@ import {
 } from "./types.ts";
 
 const ASYNC_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
+const globalStore = globalThis as Record<string, unknown>;
 
 interface TaskParam {
 	agent: string;
@@ -204,6 +207,7 @@ function emitControlNotification(input: {
 	controlConfig: ResolvedControlConfig;
 	intercomBridge: IntercomBridgeState;
 	event: ControlEvent;
+	state: SubagentState;
 }): void {
 	if (!shouldNotifyControlEvent(input.controlConfig, input.event)) return;
 	const childIntercomTarget = input.intercomBridge.active
@@ -216,14 +220,20 @@ function emitControlNotification(input: {
 		noticeText: formatControlNoticeMessage(input.event, childIntercomTarget),
 	};
 	if (input.controlConfig.notifyChannels.includes("event")) {
-		input.pi.events.emit(SUBAGENT_CONTROL_EVENT, payload);
+		// Layer B gate (Section 6): drop emits for runs that have gone stale
+		// between event construction and bus emit.
+		if (classifyRunForNotice(input.state, input.event.runId) !== "stale") {
+			input.pi.events.emit(SUBAGENT_CONTROL_EVENT, payload);
+		}
 	}
 	if (input.controlConfig.notifyChannels.includes("intercom") && input.intercomBridge.active && input.intercomBridge.orchestratorTarget) {
-		input.pi.events.emit(SUBAGENT_CONTROL_INTERCOM_EVENT, {
-			...payload,
-			to: input.intercomBridge.orchestratorTarget,
-			message: formatControlIntercomMessage(input.event, childIntercomTarget),
-		});
+		if (classifyRunForNotice(input.state, input.event.runId) !== "stale") {
+			input.pi.events.emit(SUBAGENT_CONTROL_INTERCOM_EVENT, {
+				...payload,
+				to: input.intercomBridge.orchestratorTarget,
+				message: formatControlIntercomMessage(input.event, childIntercomTarget),
+			});
+		}
 	}
 }
 
@@ -259,12 +269,16 @@ function interruptAsyncRun(state: SubagentState, runId: string | undefined): Age
 	}
 }
 
-function createForegroundControlNotifier(data: Pick<ExecutionContextData, "controlConfig" | "intercomBridge">, deps: Pick<ExecutorDeps, "pi">): (event: ControlEvent) => void {
+function createForegroundControlNotifier(
+	data: Pick<ExecutionContextData, "controlConfig" | "intercomBridge">,
+	deps: Pick<ExecutorDeps, "pi" | "state">,
+): (event: ControlEvent) => void {
 	return (event) => emitControlNotification({
 		pi: deps.pi,
 		controlConfig: data.controlConfig,
 		intercomBridge: data.intercomBridge,
 		event,
+		state: deps.state,
 	});
 }
 
@@ -1668,6 +1682,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							orchestratorTarget,
 							sessionError,
 							expandTilde: deps.expandTilde,
+							globalStore,
 						}),
 					}],
 					details: { mode: "management", results: [] },
@@ -1860,25 +1875,46 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			deps.state.lastForegroundControlId = runId;
 		}
 
+		let terminalState: "succeeded" | "failed" | "interrupted" = "succeeded";
+		let executionResult: AgentToolResult<Details> | undefined = undefined;
 		try {
 			const asyncResult = runAsyncPath(execData, deps);
 			if (asyncResult) return withForkContext(asyncResult, effectiveParams.context);
 
 			if (hasChain && effectiveParams.chain) {
-				return withForkContext(await runChainPath(execData, deps), effectiveParams.context);
+				executionResult = await runChainPath(execData, deps);
+				return withForkContext(executionResult, effectiveParams.context);
 			}
 
 			if (hasTasks && effectiveParams.tasks) {
-				return withForkContext(await runParallelPath(execData, deps), effectiveParams.context);
+				executionResult = await runParallelPath(execData, deps);
+				return withForkContext(executionResult, effectiveParams.context);
 			}
 
 			if (hasSingle) {
-				return withForkContext(await runSinglePath(execData, deps), effectiveParams.context);
+				executionResult = await runSinglePath(execData, deps);
+				return withForkContext(executionResult, effectiveParams.context);
 			}
 		} catch (error) {
+			terminalState = "failed";
 			return toExecutionErrorResult(normalizedParams, error);
 		} finally {
 			if (foregroundControl) {
+				// Derive terminalState from existing fields; do not attach a listener to
+				// foregroundControl.interrupt (it's a () => boolean callback reassigned
+				// mid-flight, not an AbortController; see types.ts:299).
+				if (terminalState !== "failed") {
+					const interrupted = executionResult?.details?.results?.some(
+						(r) => r.interrupted === true,
+					);
+					if (interrupted) {
+						terminalState = "interrupted";
+					} else if (executionResult?.isError === true) {
+						terminalState = "failed";
+					}
+					// else leave as "succeeded"
+				}
+				recordTerminalRun(globalStore, runId, terminalState);
 				deps.state.foregroundControls.delete(runId);
 				if (deps.state.lastForegroundControlId === runId) {
 					deps.state.lastForegroundControlId = null;
