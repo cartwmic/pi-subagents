@@ -175,6 +175,12 @@ export interface SingleResult {
 }
 
 export interface Details {
+	/**
+	 * Call shape of the tool result. `"management"` is used for
+	 * `action:"<management>"` calls (status, interrupt, doctor, list, etc.) —
+	 * NOT to be confused with the run's actual mode. Use `runMode` to inspect
+	 * the run's mode when looking at status responses.
+	 */
 	mode: "single" | "parallel" | "chain" | "management";
 	context?: "fresh" | "fork";
 	results: SingleResult[];
@@ -197,6 +203,30 @@ export interface Details {
 	chainAgents?: string[];      // Agent names in order, e.g., ["scout", "planner"]
 	totalSteps?: number;         // Total steps in chain
 	currentStepIndex?: number;   // 0-indexed current step (for running chains)
+	// Status-lookup enrichment fields (add-foreground-run-status-lookup).
+	// All optional and additive; populated by `inspectSubagentStatus` only.
+	/** Discriminator for which store answered the lookup. */
+	lookup?: "async" | "results" | "foreground" | "recently-terminal";
+	/** The runId resolved by the lookup (after prefix expansion). */
+	id?: string;
+	/** The run's actual mode (distinct from `mode`, which is the call shape). */
+	runMode?: "single" | "parallel" | "chain";
+	/** Currently-executing agent name for foreground responses. */
+	currentAgent?: string;
+	/** Currently-executing parallel/chain index for foreground responses. */
+	currentIndex?: number;
+	/** Last activity timestamp (ms epoch) for foreground responses. */
+	lastActivityAt?: number;
+	/** Activity state (e.g., "needs_attention") for foreground responses. */
+	activityState?: string;
+	/** Run duration so far in ms for foreground responses. */
+	durationMs?: number;
+	/** Final terminal state for recently-terminal responses. */
+	terminalState?: "succeeded" | "failed" | "interrupted";
+	/** Termination timestamp (ms epoch) for recently-terminal responses. */
+	terminatedAt?: number;
+	/** Seconds since termination for recently-terminal responses. */
+	ageSeconds?: number;
 }
 
 // ============================================================================
