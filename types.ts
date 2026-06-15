@@ -187,6 +187,42 @@ export interface SingleResult {
 	outputSaveError?: string;
 }
 
+/**
+ * Build a finished-but-FAILED SingleResult for a task whose per-task run
+ * threw or rejected. Used by the parallel/chain batch callers so one failing
+ * task settles as a partial result instead of hanging the batch or
+ * discarding successful siblings (Constitution II).
+ */
+export function buildFailedSingleResult(
+	agent: string,
+	task: string,
+	error: unknown,
+	index = 0,
+): SingleResult {
+	const message = error instanceof Error ? error.message : String(error);
+	return {
+		agent,
+		task,
+		exitCode: 1,
+		error: message,
+		messages: [],
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+		finalOutput: "",
+		progress: {
+			index,
+			agent,
+			status: "failed",
+			task,
+			recentTools: [],
+			recentOutput: [],
+			toolCount: 0,
+			tokens: 0,
+			durationMs: 0,
+			error: message,
+		},
+	};
+}
+
 export interface Details {
 	/**
 	 * Call shape of the tool result. `"management"` is used for

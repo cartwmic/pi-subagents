@@ -33,7 +33,7 @@ import { createForkContextResolver } from "./fork-context.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "./intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "./subagent-control.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.ts";
-import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd } from "./utils.ts";
+import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, mapSettled, readStatus, resolveChildCwd } from "./utils.ts";
 import {
 	buildSubagentResultIntercomPayload,
 	deliverSubagentResultIntercomEvent,
@@ -65,6 +65,7 @@ import {
 	type MaxOutputConfig,
 	type ResolvedControlConfig,
 	type SingleResult,
+	buildFailedSingleResult,
 	type SubagentState,
 	DEFAULT_ARTIFACT_CONFIG,
 	SUBAGENT_CONTROL_EVENT,
@@ -963,7 +964,7 @@ function findDuplicateParallelOutputPath(input: {
 }
 
 async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Promise<SingleResult[]> {
-	return mapConcurrent(input.tasks, input.concurrencyLimit, async (task, index) => {
+	return mapSettled(input.tasks, input.concurrencyLimit, async (task, index) => {
 		const behavior = input.behaviors[index];
 		const effectiveSkills = behavior?.skills;
 		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index);
@@ -1046,13 +1047,21 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 						});
 					}
 				: undefined,
-		}).finally(() => {
-			if (input.foregroundControl?.currentIndex === index) {
-				input.foregroundControl.interrupt = undefined;
-				input.foregroundControl.updatedAt = Date.now();
-			}
-		});
-	});
+		})
+			// Layer 1 (Constitution II): a per-task run that rejects settles as a
+			// finished-but-failed result so successful siblings are preserved and the
+			// batch returns partial results instead of hanging or discarding.
+			.catch((error) => buildFailedSingleResult(task.agent, input.taskTexts[index]!, error, index))
+			.finally(() => {
+				if (input.foregroundControl?.currentIndex === index) {
+					input.foregroundControl.interrupt = undefined;
+					input.foregroundControl.updatedAt = Date.now();
+				}
+			});
+	},
+	// Defense in depth: any throw in per-task setup (before runSync) also
+	// settles as a failed slot rather than aborting the whole pool.
+	(error, task, index) => buildFailedSingleResult(task.agent, input.taskTexts[index] ?? task.task, error, index));
 }
 
 async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): Promise<AgentToolResult<Details>> {

@@ -30,9 +30,41 @@ const execution = await tryImport<any>("./execution.ts");
 const executorMod = await tryImport<any>("./subagent-executor.ts");
 const piAvailable = !!(execution && utils);
 
+const typesMod = await tryImport<any>("./types.ts");
+
 const runSync = execution?.runSync;
 const mapConcurrent = utils?.mapConcurrent;
+const mapSettled = utils?.mapSettled;
+const buildFailedSingleResult = typesMod?.buildFailedSingleResult;
 const createSubagentExecutor = executorMod?.createSubagentExecutor;
+
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitFor<T>(fn: () => T | undefined, timeoutMs: number, label: string): Promise<T> {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		const value = fn();
+		if (value !== undefined && value !== false) return value as T;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	throw new Error(`timeout waiting for ${label}`);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+	return Promise.race([
+		promise,
+		new Promise<T>((_resolve, reject) =>
+			setTimeout(() => reject(new Error(`timeout: ${label}`)), timeoutMs).unref?.(),
+		),
+	]);
+}
 
 // ---------------------------------------------------------------------------
 // mapConcurrent — always runs (pure logic, no pi deps beyond utils.ts)
@@ -74,7 +106,9 @@ describe("mapConcurrent", { skip: !mapConcurrent ? "utils not importable" : unde
 		assert.deepEqual(results, []);
 	});
 
-	it("propagates errors", async () => {
+	it("propagates errors (fail-fast variant still rejects)", async () => {
+		// mapConcurrent retains fail-fast Promise.all semantics for callers that
+		// explicitly want it; the parallel batch callers use mapSettled instead.
 		await assert.rejects(
 			() =>
 				mapConcurrent([1, 2, 3], 2, async (item: number) => {
@@ -83,6 +117,23 @@ describe("mapConcurrent", { skip: !mapConcurrent ? "utils not importable" : unde
 				}),
 			/boom/,
 		);
+	});
+});
+
+describe("mapSettled", { skip: !mapSettled ? "utils not importable" : undefined }, () => {
+	// AC: subagent-parallel-recovery.concurrency-pool-settles-not-throws
+	it("settles with partials instead of rejecting on the first error", async () => {
+		const results = await mapSettled(
+			[1, 2, 3],
+			2,
+			async (item: number) => {
+				if (item === 2) throw new Error("boom");
+				return `ok-${item}`;
+			},
+			(error: unknown, item: number) => `failed-${item}:${(error as Error).message}`,
+		);
+		// Successful siblings preserved; failed slot replaced by fallback; order kept.
+		assert.deepEqual(results, ["ok-1", "failed-2:boom", "ok-3"]);
 	});
 });
 
@@ -149,6 +200,106 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		assert.equal(results[0].agent, "agent-a");
 		assert.equal(results[1].agent, "agent-b");
 		assert.equal(results[2].agent, "agent-c");
+	});
+
+	// AC: subagent-parallel-recovery.failed-task-settles-as-partial-result
+	it("one task fails in a batch — batch returns partial results with the failed task marked", async () => {
+		// One child exits non-zero, one exits clean. Response claim order across
+		// concurrent children is not fixed, so assert order-independently: exactly
+		// one slot failed, one succeeded, and BOTH results are present.
+		mockPi.onCall({ output: "good output", exitCode: 0 });
+		mockPi.onCall({ stderr: "child boom", exitCode: 1 });
+		const agents = makeAgentConfigs(["a", "b"]);
+
+		const results = await mapSettled(
+			[{ agent: "a" }, { agent: "b" }],
+			2,
+			async ({ agent }: any, i: number) => runSync(tempDir, agents, agent, "task", { index: i }),
+			(error: unknown, item: any, i: number) => buildFailedSingleResult(item.agent, "task", error, i),
+		);
+
+		assert.equal(results.length, 2, "both task results are returned (partial results)");
+		const failed = results.filter((r: any) => r.exitCode !== 0);
+		const succeeded = results.filter((r: any) => r.exitCode === 0);
+		assert.equal(failed.length, 1, "exactly one task is marked failed");
+		assert.equal(succeeded.length, 1, "the successful sibling is preserved");
+		assert.ok(failed[0].error, "failed task carries an error");
+		assert.deepEqual(results.map((r: any) => r.agent).sort(), ["a", "b"]);
+	});
+
+	// AC: subagent-parallel-recovery.failed-task-settles-as-partial-result
+	it("a throwing per-task run settles as a failed slot and preserves siblings", async () => {
+		mockPi.onCall({ output: "ok", exitCode: 0 });
+		const agents = makeAgentConfigs(["a"]);
+		const results = await mapSettled(
+			[{ agent: "a" }, { agent: "explode" }],
+			2,
+			async ({ agent }: any, i: number) => {
+				if (agent === "explode") throw new Error("setup blew up");
+				return runSync(tempDir, agents, agent, "task", { index: i });
+			},
+			(error: unknown, item: any, i: number) => buildFailedSingleResult(item.agent, "task", error, i),
+		);
+		assert.equal(results.length, 2);
+		assert.equal(results[0].exitCode, 0, "sibling preserved");
+		assert.equal(results[1].exitCode, 1, "throwing slot settled as failed");
+		assert.match(results[1].error, /setup blew up/);
+		assert.equal(results[1].progress?.status, "failed");
+	});
+
+	// AC: subagent-parallel-recovery.error-terminal-message-settles-promptly
+	it("a child that emits an error-terminal then holds open settles via the drain, not a hang", async () => {
+		const errorTerminal = {
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "failing turn" }],
+				model: "mock/test-model",
+				errorMessage: "model exploded",
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		};
+		// Child reports an error-terminal and then never exits on its own; with
+		// Layer 2 the existing bounded drain arms and force-terminates, so the run
+		// settles with the error surfaced instead of hanging until 'close'.
+		mockPi.onCall({ jsonl: [errorTerminal], holdOpen: true });
+		const agents = makeAgentConfigs(["a"]);
+		const result = await withTimeout(
+			runSync(tempDir, agents, "a", "task", { index: 0 }),
+			20000,
+			"runSync did not settle after error-terminal",
+		);
+		assert.match(result.error ?? "", /model exploded/);
+	});
+
+	// AC: subagent-parallel-recovery.abort-propagates-to-process-group
+	// AC: subagent-parallel-recovery.no-liveness-or-wedge-timeout
+	// (the held-open child never self-terminates on any clock; only the
+	//  caller-driven abort reaps it — recovery is cancel-driven, not timer-driven)
+	it("aborting a running task reaps the child process group (incl grandchild) and settles", { skip: process.platform === "win32" ? "POSIX process groups only" : undefined }, async () => {
+		const gcPidFile = path.join(tempDir, "grandchild.pid");
+		mockPi.onCall({ grandchildPidFile: gcPidFile, holdOpen: true });
+		const agents = makeAgentConfigs(["a"]);
+		const controller = new AbortController();
+
+		const runPromise = runSync(tempDir, agents, "a", "long running task", { index: 0, signal: controller.signal });
+
+		const gcPid = await waitFor(() => {
+			if (!fs.existsSync(gcPidFile)) return undefined;
+			const raw = fs.readFileSync(gcPidFile, "utf-8").trim();
+			return raw ? Number(raw) : undefined;
+		}, 10000, "grandchild pid file");
+		assert.ok(isAlive(gcPid), "grandchild should be running before abort");
+
+		controller.abort();
+
+		const result = await withTimeout(runPromise, 20000, "runSync did not settle after abort");
+		assert.notEqual(result.exitCode, 0, "aborted run settles as non-success");
+
+		// Group-targeted kill reaps the grandchild; a direct-child-only kill would
+		// leave it alive. This is the regression guard for Constitution III.
+		await waitFor(() => (!isAlive(gcPid) ? true : undefined), 10000, "grandchild to be reaped");
+		assert.equal(isAlive(gcPid), false, "grandchild must be dead after process-group abort");
 	});
 
 	it("all agents get independent results", async () => {

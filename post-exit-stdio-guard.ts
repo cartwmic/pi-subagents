@@ -23,6 +23,33 @@ export function trySignalChild(child: ChildWithKill, signal: NodeJS.Signals): bo
 	}
 }
 
+/**
+ * Signal a child's entire PROCESS GROUP so the child AND its descendant
+ * processes (e.g. a `claude-p` grandchild) receive the signal
+ * (Constitution III). Requires the child to have been spawned detached
+ * (its own group leader) so its pgid equals its pid; a negative pid then
+ * targets the whole group.
+ *
+ * Falls back to signalling the direct child when group signalling is
+ * unavailable (Windows, missing pid, or a thrown ESRCH/EPERM), so
+ * termination still progresses (spec: "Group signalling is unavailable").
+ */
+export function killChildGroup(
+	child: ChildWithKill & { pid?: number },
+	signal: NodeJS.Signals,
+): boolean {
+	const pid = child.pid;
+	if (typeof pid === "number" && pid > 0 && process.platform !== "win32") {
+		try {
+			process.kill(-pid, signal);
+			return true;
+		} catch {
+			// Group gone or not a group leader — fall back to the direct child.
+		}
+	}
+	return trySignalChild(child, signal);
+}
+
 export function attachPostExitStdioGuard(
 	child: ChildWithPipedStdio,
 	options: PostExitStdioGuardOptions,

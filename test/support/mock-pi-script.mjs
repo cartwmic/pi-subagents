@@ -108,6 +108,16 @@ async function main() {
 		"utf-8",
 	);
 
+	// Test hook (subagent-parallel-recovery): spawn a real grandchild in THIS
+	// process's group so an abort that targets the process GROUP must reap it.
+	// The grandchild writes its pid and then sleeps; only a delivered signal
+	// ends it. Used by the abort-propagates-to-process-group integration test.
+	if (typeof response.grandchildPidFile === "string" && response.grandchildPidFile.length > 0) {
+		const { spawn } = await import("node:child_process");
+		const code = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(response.grandchildPidFile)}, String(process.pid));setInterval(()=>{}, 3600000);`;
+		spawn(process.execPath, ["-e", code], { stdio: "ignore" });
+	}
+
 	if (typeof response.delay === "number" && response.delay > 0) {
 		await new Promise((resolve) => setTimeout(resolve, response.delay));
 	}
@@ -137,6 +147,16 @@ async function main() {
 
 	if (typeof response.stderr === "string" && response.stderr.length > 0) {
 		process.stderr.write(response.stderr);
+	}
+
+	// Test hook: after flushing all output, never exit on our own — settle only
+	// when a delivered signal (e.g. an abort-driven process-group kill, or the
+	// error-terminal drain) ends us. Exercises Layer 2 + Layer 3 recovery.
+	if (response.holdOpen === true) {
+		// A live timer keeps the event loop (and process) alive so the child does
+		// NOT exit on its own; only a delivered signal ends it.
+		setInterval(() => {}, 3600000);
+		await new Promise(() => {});
 	}
 
 	process.exit(typeof response.exitCode === "number" ? response.exitCode : 0);

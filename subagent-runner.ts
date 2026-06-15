@@ -35,12 +35,13 @@ import {
 	isParallelGroup,
 	flattenSteps,
 	mapConcurrent,
+	mapSettled,
 	aggregateParallelOutputs,
 	MAX_PARALLEL_CONCURRENCY,
 } from "./parallel-utils.ts";
 import { buildPiArgs, cleanupTempDir } from "./pi-args.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "./model-fallback.ts";
-import { attachPostExitStdioGuard, trySignalChild } from "./post-exit-stdio-guard.ts";
+import { attachPostExitStdioGuard, killChildGroup } from "./post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "./utils.ts";
 import { parseSessionTokens, type TokenUsage } from "./session-tokens.ts";
 import {
@@ -185,7 +186,10 @@ function runPiStreaming(
 			...(piPackageRoot ? { piPackageRoot } : {}),
 			...(piArgv1 ? { argv1: piArgv1 } : {}),
 		});
-		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
+		// Constitution III: detached so the child is its own process-group leader
+		// and forced-termination/interrupt can signal the GROUP (descendants too).
+		// Not unref'd. Windows keeps the default and falls back to direct-child kill.
+		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv, detached: process.platform !== "win32" });
 		let stderr = "";
 		let stdoutBuf = "";
 		let stderrBuf = "";
@@ -263,7 +267,10 @@ function runPiStreaming(
 				const stopReason = (event.message as { stopReason?: string }).stopReason;
 				const hasToolCall = Array.isArray(event.message.content)
 					&& event.message.content.some((part) => (part as { type?: string }).type === "toolCall");
-				if (stopReason === "stop" && !hasToolCall) startFinalDrain();
+				// Constitution II: arm the existing bounded drain on an error-terminal
+				// too, so an erroring child settles instead of hanging until 'close'.
+				const isErrorTerminal = Boolean(event.message.errorMessage);
+				if ((stopReason === "stop" || isErrorTerminal) && !hasToolCall) startFinalDrain();
 			}
 		};
 
@@ -305,9 +312,9 @@ function runPiStreaming(
 			if (settled) return;
 			interrupted = true;
 			if (!error) error = "Interrupted. Waiting for explicit next action.";
-			trySignalChild(child, "SIGINT");
+			killChildGroup(child, "SIGINT");
 			setTimeout(() => {
-				if (!settled) trySignalChild(child, "SIGTERM");
+				if (!settled) killChildGroup(child, "SIGTERM");
 			}, 1000).unref?.();
 		});
 		const clearDrainTimers = () => {
@@ -324,13 +331,13 @@ function runPiStreaming(
 			if (childExited || finalDrainTimer || settled) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled) return;
-				const termSent = trySignalChild(child, "SIGTERM");
+				const termSent = killChildGroup(child, "SIGTERM");
 				if (!termSent) return;
 				forcedTerminationSignal = true;
 				appendChildLine("subagent.child.stderr", `[warn] Subagent process did not exit within ${FINAL_DRAIN_MS}ms after its final message. Forcing termination.`);
 				finalHardKillTimer = setTimeout(() => {
 					if (settled) return;
-					forcedTerminationSignal = trySignalChild(child, "SIGKILL") || forcedTerminationSignal;
+					forcedTerminationSignal = killChildGroup(child, "SIGKILL") || forcedTerminationSignal;
 				}, HARD_KILL_MS);
 				finalHardKillTimer.unref?.();
 			}, FINAL_DRAIN_MS);
@@ -1081,7 +1088,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					runId: id,
 					stepIndex,
 				});
-				const parallelResults = await mapConcurrent(
+				const parallelResults = await mapSettled(
 					group.parallel,
 					concurrency,
 					async (task, taskIdx) => {
@@ -1101,7 +1108,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							: undefined;
 						const { taskForRun, taskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
 
-						const singleResult = await runSingleStep(taskForRun, {
+						let singleResult: Awaited<ReturnType<typeof runSingleStep>>;
+						try {
+						singleResult = await runSingleStep(taskForRun, {
 							previousOutput, placeholder, cwd: taskCwd, sessionEnabled,
 							sessionDir: taskSessionDir,
 							artifactsDir, artifactConfig, id,
@@ -1114,6 +1123,16 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 								activeChildInterrupt = interrupt;
 							},
 						});
+						} catch (error) {
+							// Layer 1 (Constitution II): an async parallel task that throws
+							// settles as a failed result so siblings are preserved.
+							singleResult = {
+								agent: task.agent,
+								output: "",
+								exitCode: 1 as number | null,
+								error: error instanceof Error ? error.message : String(error),
+							};
+						}
 						if (task.sessionFile) {
 							latestSessionFile = task.sessionFile;
 						}
@@ -1141,6 +1160,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						if (singleResult.exitCode !== 0 && failFast) aborted = true;
 						return { ...singleResult, skipped: false };
 					},
+					// Defense in depth: a throw before/around runSingleStep settles the slot.
+					(error, task) => ({
+						agent: task.agent,
+						output: "",
+						exitCode: 1 as number | null,
+						error: error instanceof Error ? error.message : String(error),
+						skipped: false,
+					}),
 				);
 
 				flatIndex += group.parallel.length;

@@ -451,4 +451,4 @@ export function extractTextFromContent(content: unknown): string {
 // Concurrency Utilities
 // ============================================================================
 
-export { mapConcurrent } from "./parallel-utils.ts";
+export { mapConcurrent, mapSettled } from "./parallel-utils.ts";

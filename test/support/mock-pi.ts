@@ -15,6 +15,9 @@ export interface MockPiResponse {
 		stderr?: string;
 	}>;
 	echoEnv?: string[];
+	// Test hooks for subagent-parallel-recovery (abort → process-group kill):
+	grandchildPidFile?: string;
+	holdOpen?: boolean;
 }
 
 export interface MockPi {
