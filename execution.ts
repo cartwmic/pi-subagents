@@ -45,7 +45,7 @@ import {
 import { buildSkillInjection, resolveSkillsWithFallback } from "./skills.ts";
 import { getPiSpawnCommand } from "./pi-spawn.ts";
 import { createJsonlWriter } from "./jsonl-writer.ts";
-import { attachPostExitStdioGuard, trySignalChild } from "./post-exit-stdio-guard.ts";
+import { attachPostExitStdioGuard, killChildGroup } from "./post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "./pi-args.ts";
 import { captureSingleOutputSnapshot, resolveSingleOutput, type SingleOutputSnapshot } from "./single-output.ts";
 import {
@@ -181,6 +181,12 @@ async function runSingleAttempt(
 			cwd: options.cwd ?? runtimeCwd,
 			env: spawnEnv,
 			stdio: ["ignore", "pipe", "pipe"],
+			// Constitution III: spawn detached so the child is its own process-group
+			// leader; on abort/forced-termination we signal the GROUP (negative pid)
+			// so descendant processes (e.g. claude-p) die too and 'close' settles the
+			// slot. Not unref'd — the parent still awaits the child. Windows keeps the
+			// default (no detach) and falls back to direct-child kill.
+			detached: process.platform !== "win32",
 		});
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let buf = "";
@@ -229,13 +235,13 @@ async function runSingleAttempt(
 			if (childExited || finalDrainTimer || settled || processClosed || detached) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled || processClosed || detached) return;
-				const termSent = trySignalChild(proc, "SIGTERM");
+				const termSent = killChildGroup(proc, "SIGTERM");
 				if (!termSent) return;
 				forcedTerminationSignal = true;
 				appendRecentOutput(progress, [`[warn] Subagent process did not exit within ${FINAL_DRAIN_MS}ms after its final message. Forcing termination.`]);
 				finalHardKillTimer = setTimeout(() => {
 					if (settled || processClosed || detached) return;
-					forcedTerminationSignal = trySignalChild(proc, "SIGKILL") || forcedTerminationSignal;
+					forcedTerminationSignal = killChildGroup(proc, "SIGKILL") || forcedTerminationSignal;
 				}, HARD_KILL_MS);
 				finalHardKillTimer.unref?.();
 			}, FINAL_DRAIN_MS);
@@ -401,11 +407,17 @@ async function runSingleAttempt(
 					if (!result.model && evt.message.model) result.model = evt.message.model;
 					if (evt.message.errorMessage) result.error = evt.message.errorMessage;
 					appendRecentOutput(progress, extractTextFromContent(evt.message.content).split("\n").slice(-10));
-					// Final assistant message: start the exit drain window.
+					// Final assistant message: start the exit drain window. Constitution II
+					// (error propagation): a child that emits an error-terminal
+					// (errorMessage set) settles via the SAME bounded drain instead of
+					// hanging until 'close'. The !hasToolCall guard mirrors the clean-stop
+					// case — an error accompanying a pending tool call is not terminal.
+					// This is error propagation, NOT a wedge timer (Constitution I, IV).
 					const stopReason = (evt.message as { stopReason?: string }).stopReason;
 					const hasToolCall = Array.isArray(evt.message.content)
 						&& evt.message.content.some((part) => (part as { type?: string }).type === "toolCall");
-					if (stopReason === "stop" && !hasToolCall) {
+					const isErrorTerminal = Boolean(evt.message.errorMessage);
+					if ((stopReason === "stop" || isErrorTerminal) && !hasToolCall) {
 						startFinalDrain();
 					}
 				}
@@ -486,8 +498,13 @@ async function runSingleAttempt(
 					detachForIntercom();
 					return;
 				}
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				// Constitution III: SIGTERM→SIGKILL the GROUP so a wedged child plus its
+				// descendant tree die, and the resulting 'close' settles the slot.
+				killChildGroup(proc, "SIGTERM");
+				setTimeout(() => {
+					if (settled || processClosed || detached) return;
+					killChildGroup(proc, "SIGKILL");
+				}, 3000).unref?.();
 			};
 			if (options.signal.aborted) kill();
 			else {
@@ -506,10 +523,12 @@ async function runSingleAttempt(
 				result.finalOutput = "Interrupted. Waiting for explicit next action.";
 				progress.activityState = undefined;
 				fireUpdate();
-				trySignalChild(proc, "SIGINT");
+				// Reach the descendant tree (e.g. claude-p) so an interrupt actually
+				// stops the in-flight model call, not just the direct child.
+				killChildGroup(proc, "SIGINT");
 				setTimeout(() => {
 					if (settled || processClosed || detached) return;
-					trySignalChild(proc, "SIGTERM");
+					killChildGroup(proc, "SIGTERM");
 				}, 1000).unref?.();
 			};
 			if (options.interruptSignal.aborted) interrupt();

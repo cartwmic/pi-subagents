@@ -30,7 +30,7 @@ import { discoverAvailableSkills, normalizeSkillInput } from "./skills.ts";
 import { INTERCOM_BRIDGE_MARKER } from "./intercom-bridge.ts";
 import { runSync } from "./execution.ts";
 import { buildChainSummary } from "./formatters.ts";
-import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, resolveChildCwd } from "./utils.ts";
+import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, mapSettled, resolveChildCwd } from "./utils.ts";
 import { recordRun } from "./run-history.ts";
 import {
 	cleanupWorktrees,
@@ -51,6 +51,7 @@ import {
 	type IntercomEventBus,
 	type ResolvedControlConfig,
 	type SingleResult,
+	buildFailedSingleResult,
 	MAX_CONCURRENCY,
 	resolveChildMaxSubagentDepth,
 } from "./types.ts";
@@ -160,7 +161,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 	const failFast = input.step.failFast ?? false;
 	let aborted = false;
 
-	const parallelResults = await mapConcurrent(
+	const parallelResults = await mapSettled(
 		input.step.parallel,
 		concurrency,
 		async (task, taskIndex) => {
@@ -220,7 +221,9 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				};
 			}
 
-			const result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
+			let result: SingleResult;
+			try {
+			result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
 				cwd: taskCwd,
 				signal: input.signal,
 				interruptSignal: interruptController.signal,
@@ -271,6 +274,11 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 					}
 					: undefined,
 			});
+			} catch (error) {
+				// Layer 1 (Constitution II): settle a rejecting task as a failed result
+				// so successful chain-parallel siblings are preserved.
+				result = buildFailedSingleResult(task.agent, cleanTask, error, input.globalTaskIndex + taskIndex);
+			}
 			if (input.foregroundControl?.currentIndex === input.globalTaskIndex + taskIndex) {
 				input.foregroundControl.interrupt = undefined;
 				input.foregroundControl.updatedAt = Date.now();
@@ -282,6 +290,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			recordRun(task.agent, cleanTask, result.exitCode, result.progressSummary?.durationMs ?? 0);
 			return result;
 		},
+		(error, task, taskIndex) =>
+			buildFailedSingleResult(task.agent, task.task, error, input.globalTaskIndex + taskIndex),
 	);
 
 	return parallelResults;

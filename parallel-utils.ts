@@ -64,6 +64,43 @@ export async function mapConcurrent<T, R>(
 	return results;
 }
 
+/**
+ * Like mapConcurrent, but SETTLE-not-throw: if `fn` rejects for an item, the
+ * rejection is caught and that slot is filled by `onError(error, item, i)`
+ * instead of aborting the whole pool. Guarantees one result per input in
+ * input order, so a single failing task never discards successful siblings
+ * (Constitution II: a failed task settles as a partial result).
+ *
+ * `mapConcurrent` is left intact for callers that intentionally want
+ * fail-fast (Promise.all) semantics.
+ */
+export async function mapSettled<T, R>(
+	items: T[],
+	limit: number,
+	fn: (item: T, i: number) => Promise<R>,
+	onError: (error: unknown, item: T, i: number) => R,
+): Promise<R[]> {
+	const safeLimit = Math.max(1, Math.floor(limit) || 1);
+	const results: R[] = new Array(items.length);
+	let next = 0;
+
+	async function worker(): Promise<void> {
+		while (next < items.length) {
+			const i = next++;
+			try {
+				results[i] = await fn(items[i], i);
+			} catch (error) {
+				results[i] = onError(error, items[i], i);
+			}
+		}
+	}
+
+	await Promise.all(
+		Array.from({ length: Math.min(safeLimit, items.length) }, () => worker()),
+	);
+	return results;
+}
+
 export interface ParallelTaskResult {
 	agent: string;
 	taskIndex?: number;

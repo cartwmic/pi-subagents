@@ -4,6 +4,7 @@ import {
 	isParallelGroup,
 	flattenSteps,
 	mapConcurrent,
+	mapSettled,
 	aggregateParallelOutputs,
 	MAX_PARALLEL_CONCURRENCY,
 	type RunnerSubagentStep,
@@ -149,6 +150,61 @@ describe("mapConcurrent", () => {
 		const d2 = startTimes[2]! - startTimes[0]!;
 		assert.ok(d1 < 20, `worker 1 should start immediately, got ${d1}ms delay`);
 		assert.ok(d2 < 20, `worker 2 should start immediately, got ${d2}ms delay`);
+	});
+});
+
+describe("mapSettled", () => {
+	// AC: subagent-parallel-recovery.concurrency-pool-settles-not-throws
+	it("equals mapConcurrent output when no fn rejects", async () => {
+		const items = [1, 2, 3, 4];
+		const fallback = () => -1;
+		const settled = await mapSettled(items, 2, async (n) => n * 10, fallback);
+		const plain = await mapConcurrent(items, 2, async (n) => n * 10);
+		assert.deepEqual(settled, plain);
+		assert.deepEqual(settled, [10, 20, 30, 40]);
+	});
+
+	it("settles all slots when one fn rejects, preserving siblings and order", async () => {
+		const items = [1, 2, 3];
+		const seen: unknown[] = [];
+		const results = await mapSettled(
+			items,
+			2,
+			async (n) => {
+				if (n === 2) throw new Error("boom");
+				return `ok-${n}`;
+			},
+			(error, item, i) => {
+				seen.push({ message: (error as Error).message, item, i });
+				return `failed-${item}`;
+			},
+		);
+		// One result per input, in input order; rejecting slot replaced by fallback,
+		// successful siblings preserved.
+		assert.deepEqual(results, ["ok-1", "failed-2", "ok-3"]);
+		assert.deepEqual(seen, [{ message: "boom", item: 2, i: 1 }]);
+	});
+
+	it("does not abort the pool on the first rejection", async () => {
+		const items = [1, 2, 3, 4];
+		let completed = 0;
+		const results = await mapSettled(
+			items,
+			2,
+			async (n) => {
+				if (n % 2 === 0) throw new Error(`reject-${n}`);
+				completed++;
+				return n;
+			},
+			(_e, item) => `fb-${item}`,
+		);
+		assert.deepEqual(results, [1, "fb-2", 3, "fb-4"]);
+		assert.equal(completed, 2, "odd items still completed despite even rejections");
+	});
+
+	it("handles empty input", async () => {
+		const results = await mapSettled<number, number>([], 4, async (n) => n, () => -1);
+		assert.deepEqual(results, []);
 	});
 });
 
