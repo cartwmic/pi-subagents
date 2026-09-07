@@ -80,7 +80,7 @@ import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudget
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
-import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
+import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, createChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import {
 	acceptChildWatchdogEvent,
 	childWatchdogIsActive,
@@ -433,6 +433,7 @@ async function runSingleAttempt(
 		let forcedTerminationSignal = false;
 		let cleanTerminalAssistantStopReceived = false;
 		let agentSettledReceived = false;
+		const childLifecycle = createChildLifecycle();
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardKillTimer: NodeJS.Timeout | undefined;
 		let watchdogTailTimer: NodeJS.Timeout | undefined;
@@ -459,6 +460,7 @@ async function runSingleAttempt(
 			}
 		};
 		const startFinalDrain = () => {
+			if (!childLifecycle.canDrain()) return;
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
@@ -715,8 +717,12 @@ async function runSingleAttempt(
 				return;
 			}
 			shared.transcriptWriter?.writeChildEvent(evt);
+			if (evt.type === "agent_start" || evt.type === "turn_start") {
+				cleanTerminalAssistantStopReceived = false;
+				agentSettledReceived = false;
+			}
 			if (evt.type === "agent_settled") agentSettledReceived = true;
-			applyChildLifecycle(projectChildLifecycle(evt));
+			applyChildLifecycle(childLifecycle.project(evt));
 
 			if (isChildWatchdogStatusEvent(evt)) {
 				if (!childWatchdog) return;
@@ -814,7 +820,7 @@ async function runSingleAttempt(
 					if (terminalAssistantStop) {
 						if (!evt.message.errorMessage && assistantText.trim()) assistantError = undefined;
 						cleanTerminalAssistantStopReceived ||= !evt.message.errorMessage;
-						applyChildLifecycle(projectChildLifecycle(evt, true));
+						applyChildLifecycle(childLifecycle.project(evt, true));
 					}
 				}
 				updateActivityState(now);

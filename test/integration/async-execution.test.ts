@@ -627,6 +627,25 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(Date.now() - startedAt >= 1200, "background runner must not terminate during the retry delay");
 	});
 
+	for (const resume of [true, false]) {
+		it(`preserves slow compaction and ${resume ? "continuation" : "final-stop cleanup"}`, { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			mockPi.onCall({ steps: [
+				{ jsonl: [events.assistantMessage("before compaction"), { type: "agent_settled" }, { type: "compaction_start", reason: "manual" }] },
+				{ delay: 1400, jsonl: [{ type: "agent_settled" }] },
+				{ delay: 1400, jsonl: [{ type: "compaction_end", reason: "manual" }, ...(resume ? [{ type: "agent_start" }, { type: "turn_start" }] : [])] },
+				...(resume ? [{ delay: 1400, jsonl: [events.assistantMessage("after compaction"), { type: "agent_settled" }] }] : []),
+			], keepAliveAfterFinalMessageMs: 10000 });
+			const startedAt = Date.now();
+			const id = `async-compaction-${resume}-${Date.now().toString(36)}`;
+			launchProtocolTest(id);
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, true);
+			assert.equal(payload.results[0]?.output, resume ? "after compaction" : "before compaction");
+			assert.ok(Date.now() - startedAt >= (resume ? 4000 : 2600), "must finish slow extension work");
+			assert.ok(Date.now() - startedAt < 9000, "must retain bounded lingering-child cleanup");
+		});
+	}
+
 	it("background treats agent_settled as a clean terminal watermark", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ jsonl: [mockAssistantMessage("settled async without a terminal assistant stop", "tool_use"), { type: "agent_settled" }], keepAliveAfterFinalMessageMs: 5000 });
 		const id = `async-lifecycle-settled-${Date.now().toString(36)}`;

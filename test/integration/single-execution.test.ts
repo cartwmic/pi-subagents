@@ -1511,6 +1511,24 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.ok(Date.now() - startedAt >= 1200, "foreground runner must not terminate during the retry delay");
 	});
 
+	for (const resume of [true, false]) {
+		it(`preserves slow compaction and ${resume ? "continuation" : "final-stop cleanup"}`, async () => {
+			mockPi.onCall({ steps: [
+				{ jsonl: [events.assistantMessage("before compaction"), { type: "agent_settled" }, { type: "compaction_start", reason: "manual" }] },
+				{ delay: 1400, jsonl: [{ type: "agent_settled" }] },
+				{ delay: 1400, jsonl: [{ type: "compaction_end", reason: "manual" }, ...(resume ? [{ type: "agent_start" }, { type: "turn_start" }] : [])] },
+				...(resume ? [{ delay: 1400, jsonl: [events.assistantMessage("after compaction"), { type: "agent_settled" }] }] : []),
+			], keepAliveAfterFinalMessageMs: 10000 });
+			const startedAt = Date.now();
+			const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Compact and continue", { acceptance: false });
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.error, undefined);
+			assert.equal(getFinalOutput(result.messages), resume ? "after compaction" : "before compaction");
+			assert.ok(Date.now() - startedAt >= (resume ? 4000 : 2600), "must finish slow extension work");
+			assert.ok(Date.now() - startedAt < 9000, "must retain bounded lingering-child cleanup");
+		});
+	}
+
 	it("treats agent_settled as a clean terminal watermark", async () => {
 		const nonTerminalMessage = events.assistantMessage("settled without a terminal assistant stop") as { message: { stopReason: string } };
 		nonTerminalMessage.message.stopReason = "length";

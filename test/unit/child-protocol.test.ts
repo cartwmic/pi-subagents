@@ -6,7 +6,7 @@ import {
 	createBoundedLineReader,
 	formatProtocolOutputLimit,
 	MAX_CHILD_PENDING_LINE_BYTES,
-	projectChildLifecycle,
+	createChildLifecycle,
 	type ProtocolOutputLimit,
 } from "../../src/runs/shared/child-protocol.ts";
 
@@ -72,11 +72,42 @@ describe("bounded child stderr tail", () => {
 });
 
 describe("child lifecycle projection", () => {
+	for (const settledFirst of [true, false]) {
+		it(`defers compaction cleanup with settledFirst=${settledFirst}`, () => {
+			const lifecycle = createChildLifecycle();
+			assert.equal(lifecycle.project({ type: "message_end" }, true), "start-drain");
+			if (settledFirst) lifecycle.project({ type: "agent_settled" });
+			assert.equal(lifecycle.project({ type: "compaction_start" }), "cancel-drain");
+			assert.equal(lifecycle.canDrain(), false);
+			if (!settledFirst) assert.equal(lifecycle.project({ type: "agent_settled" }), "none");
+			assert.equal(lifecycle.project({ type: "compaction_end" }), "start-drain");
+			assert.equal(lifecycle.canDrain(), true, "final compaction retains bounded cleanup");
+			assert.equal(lifecycle.project({ type: "agent_start" }), "cancel-drain");
+			assert.equal(lifecycle.canDrain(), false, "continuation is active work");
+			assert.equal(lifecycle.project({ type: "message_end" }, true), "start-drain");
+		});
+	}
+
+	it("does not turn between-turn compaction into terminal cleanup", () => {
+		const lifecycle = createChildLifecycle();
+		assert.equal(lifecycle.project({ type: "compaction_start" }), "cancel-drain");
+		assert.equal(lifecycle.project({ type: "compaction_end" }), "none");
+		assert.equal(lifecycle.canDrain(), false);
+	});
+
+	it("cancels an assistant-stop fallback when a queued follow-up starts another turn", () => {
+		const lifecycle = createChildLifecycle();
+		lifecycle.project({ type: "message_end" }, true);
+		assert.equal(lifecycle.project({ type: "turn_start" }), "cancel-drain");
+		assert.equal(lifecycle.canDrain(), false);
+	});
+
 	it("cancels legacy drain for retries and starts it when settled", () => {
-		assert.equal(projectChildLifecycle({ type: "message_end" }, true), "start-drain");
-		assert.equal(projectChildLifecycle({ type: "agent_end", willRetry: true }), "cancel-drain");
-		assert.equal(projectChildLifecycle({ type: "agent_end", willRetry: false }), "none");
-		assert.equal(projectChildLifecycle({ type: "agent_settled" }), "start-drain");
-		assert.equal(projectChildLifecycle({ type: "tool_execution_start" }), "none");
+		const lifecycle = createChildLifecycle();
+		assert.equal(lifecycle.project({ type: "message_end" }, true), "start-drain");
+		assert.equal(lifecycle.project({ type: "agent_end", willRetry: true }), "cancel-drain");
+		assert.equal(lifecycle.project({ type: "agent_end", willRetry: false }), "none");
+		assert.equal(lifecycle.project({ type: "agent_settled" }), "start-drain");
+		assert.equal(lifecycle.project({ type: "tool_execution_start" }), "none");
 	});
 });

@@ -113,9 +113,37 @@ export function createBoundedByteTail(maxBytes = MAX_CHILD_STDERR_BYTES): {
 
 export type ChildLifecycleAction = "start-drain" | "cancel-drain" | "none";
 
-export function projectChildLifecycle(event: { type?: string; willRetry?: unknown }, terminalAssistantStop = false): ChildLifecycleAction {
-	if (event.type === "agent_end" && event.willRetry === true) return "cancel-drain";
-	if (event.type === "agent_settled") return "start-drain";
-	if (terminalAssistantStop) return "start-drain";
-	return "none";
+export function createChildLifecycle(): {
+	project(event: { type?: string; willRetry?: unknown }, terminalAssistantStop?: boolean): ChildLifecycleAction;
+	canDrain(): boolean;
+} {
+	let compacting = false;
+	let terminal = false;
+	return {
+		canDrain: () => terminal && !compacting,
+		project(event, terminalAssistantStop = false) {
+			// agent_settled settles a run, not extension-owned ctx.compact() work.
+			// Print mode can still be draining a summary and its continuation.
+			if (event.type === "compaction_start") {
+				compacting = true;
+				return "cancel-drain";
+			}
+			if (event.type === "compaction_end") {
+				compacting = false;
+				// Final-turn compaction need not start another run. Keep its bounded
+				// cleanup; an onComplete/onError continuation cancels it below.
+				return terminal ? "start-drain" : "none";
+			}
+			if (event.type === "agent_start" || event.type === "turn_start"
+				|| (event.type === "agent_end" && event.willRetry === true)) {
+				terminal = false;
+				return "cancel-drain";
+			}
+			if (event.type === "agent_settled" || terminalAssistantStop) {
+				terminal = true;
+				return compacting ? "none" : "start-drain";
+			}
+			return "none";
+		},
+	};
 }

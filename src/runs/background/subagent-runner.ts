@@ -104,7 +104,7 @@ import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudget
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup } from "../shared/parallel-handoff.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
-import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
+import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, createChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
 import { decodeSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import {
@@ -522,8 +522,12 @@ function runPiStreaming(
 
 			appendChildEvent(event);
 			transcriptWriter?.writeChildEvent(event);
+			if (event.type === "agent_start" || event.type === "turn_start") {
+				cleanTerminalAssistantStopReceived = false;
+				agentSettledReceived = false;
+			}
 			if (event.type === "agent_settled") agentSettledReceived = true;
-			applyChildLifecycle(projectChildLifecycle(event));
+			applyChildLifecycle(childLifecycle.project(event));
 
 			if (isChildWatchdogStatusEvent(event)) {
 				if (!childWatchdogConfig) return;
@@ -583,7 +587,7 @@ function runPiStreaming(
 				if (isTerminalAssistantStop(event.message)) {
 					if (!event.message.errorMessage && extractTextFromContent(event.message.content).trim()) assistantError = undefined;
 					cleanTerminalAssistantStopReceived ||= !event.message.errorMessage;
-					applyChildLifecycle(projectChildLifecycle(event, true));
+					applyChildLifecycle(childLifecycle.project(event, true));
 				}
 			}
 		};
@@ -597,6 +601,7 @@ function runPiStreaming(
 		let forcedTerminationSignal = false;
 		let cleanTerminalAssistantStopReceived = false;
 		let agentSettledReceived = false;
+		const childLifecycle = createChildLifecycle();
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardKillTimer: NodeJS.Timeout | undefined;
 		let watchdogTailTimer: NodeJS.Timeout | undefined;
@@ -723,6 +728,7 @@ function runPiStreaming(
 			}
 		};
 		function startFinalDrain(): void {
+			if (!childLifecycle.canDrain()) return;
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
