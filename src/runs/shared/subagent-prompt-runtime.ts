@@ -21,6 +21,7 @@ import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
 import { resolveWaitToolConfig } from "../background/wait-config.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
+import { CHILD_HOST_LIFECYCLE_EVENT } from "./child-protocol.ts";
 
 const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV = "PI_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 const SUBAGENT_INHERIT_SKILLS_ENV = "PI_SUBAGENT_INHERIT_SKILLS";
@@ -346,6 +347,22 @@ export function registerSteeringInbox(
 }
 
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
+	// Print mode drains extension work before session teardown. Agent settlement
+	// and compaction_end are earlier boundaries, including before input hooks.
+	// Use the diagnostic channel: JSON mode redirects extension stdout to stderr
+	// and unsubscribes session events before disposal. These are protocol records,
+	// not chat messages, and must remain observable during session_shutdown.
+	// Start a fresh line even if an extension left an unterminated diagnostic.
+	let hostLifecycleEnabled = false;
+	pi.on("session_start", (_event, ctx) => {
+		hostLifecycleEnabled = process.env.PI_SUBAGENT_CHILD === "1" && ctx.mode === "json";
+		if (hostLifecycleEnabled) process.stderr.write(`\n${JSON.stringify({ type: CHILD_HOST_LIFECYCLE_EVENT, version: 1, phase: "ready" })}\n`);
+	});
+	pi.on("session_shutdown", (event) => {
+		if (hostLifecycleEnabled && event.reason === "quit") {
+			process.stderr.write(`\n${JSON.stringify({ type: CHILD_HOST_LIFECYCLE_EVENT, version: 1, phase: "shutdown" })}\n`);
+		}
+	});
 	registerSteeringInbox(pi);
 	registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV], { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }));
 	registerChildWatchdog(pi);

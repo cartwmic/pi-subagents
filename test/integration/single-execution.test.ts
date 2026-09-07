@@ -1529,6 +1529,24 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		});
 	}
 
+	for (const resume of [true, false]) {
+		it(`waits for host teardown with ${resume ? "delayed preflight" : "final compaction"}`, async () => {
+			mockPi.onCall({ steps: [
+				{ stderr: '{"type":"subagent_host_lifecycle","version":1,"phase":"ready"}\n' },
+				{ jsonl: [events.assistantMessage("before compaction"), { type: "agent_settled" }, { type: "compaction_start" }, { type: "compaction_end" }] },
+				{ delay: 1400, jsonl: resume ? [{ type: "agent_start" }, events.assistantMessage("after compaction"), { type: "agent_settled" }] : [] },
+				{ delay: 1400, stderr: '{"type":"subagent_host_lifecycle","version":1,"phase":"shutdown"}\n' },
+			], keepAliveAfterFinalMessageMs: 10000 });
+			const startedAt = Date.now();
+			const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Compact and continue", { acceptance: false });
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.error, undefined);
+			assert.equal(getFinalOutput(result.messages), resume ? "after compaction" : "before compaction");
+			assert.ok(Date.now() - startedAt >= 3600, "must wait through preflight and host teardown");
+			assert.ok(Date.now() - startedAt < 9000, "must bound lingering process cleanup");
+		});
+	}
+
 	it("treats agent_settled as a clean terminal watermark", async () => {
 		const nonTerminalMessage = events.assistantMessage("settled without a terminal assistant stop") as { message: { stopReason: string } };
 		nonTerminalMessage.message.stopReason = "length";

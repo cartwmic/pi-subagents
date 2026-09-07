@@ -111,17 +111,48 @@ export function createBoundedByteTail(maxBytes = MAX_CHILD_STDERR_BYTES): {
 	};
 }
 
+export const CHILD_HOST_LIFECYCLE_EVENT = "subagent_host_lifecycle";
+
+export function parseChildHostLifecycle(line: string): { type: string; version: 1; phase: "ready" | "shutdown" } | undefined {
+	try {
+		const event = JSON.parse(line);
+		if (event?.type === CHILD_HOST_LIFECYCLE_EVENT && event.version === 1
+			&& (event.phase === "ready" || event.phase === "shutdown")) return event;
+	} catch {
+		// Ordinary stderr is not protocol.
+	}
+	return undefined;
+}
+
 export type ChildLifecycleAction = "start-drain" | "cancel-drain" | "none";
 
 export function createChildLifecycle(): {
-	project(event: { type?: string; willRetry?: unknown }, terminalAssistantStop?: boolean): ChildLifecycleAction;
+	project(event: { type?: string; willRetry?: unknown; version?: unknown; phase?: unknown }, terminalAssistantStop?: boolean): ChildLifecycleAction;
 	canDrain(): boolean;
 } {
 	let compacting = false;
 	let terminal = false;
+	let hostOwnsDrain = false;
+	let hostShuttingDown = false;
 	return {
-		canDrain: () => terminal && !compacting,
+		canDrain: () => hostOwnsDrain ? hostShuttingDown : terminal && !compacting,
 		project(event, terminalAssistantStop = false) {
+			if (event.type === CHILD_HOST_LIFECYCLE_EVENT && event.version === 1) {
+				if (event.phase === "ready") {
+					hostOwnsDrain = true;
+					hostShuttingDown = false;
+					return "cancel-drain";
+				}
+				if (event.phase === "shutdown" && hostOwnsDrain) {
+					hostShuttingDown = true;
+					return "start-drain";
+				}
+			}
+			// The print host owns extension callbacks and prompt preflight, which
+			// can outlive compaction_end without emitting another agent_start yet.
+			// Only its teardown starts final cleanup; explicit deadlines still apply.
+			if (hostOwnsDrain) return "none";
+			// Compatibility for older child runtimes without the host handshake.
 			// agent_settled settles a run, not extension-owned ctx.compact() work.
 			// Print mode can still be draining a summary and its continuation.
 			if (event.type === "compaction_start") {

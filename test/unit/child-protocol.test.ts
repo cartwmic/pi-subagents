@@ -7,6 +7,8 @@ import {
 	formatProtocolOutputLimit,
 	MAX_CHILD_PENDING_LINE_BYTES,
 	createChildLifecycle,
+	CHILD_HOST_LIFECYCLE_EVENT,
+	parseChildHostLifecycle,
 	type ProtocolOutputLimit,
 } from "../../src/runs/shared/child-protocol.ts";
 
@@ -72,6 +74,55 @@ describe("bounded child stderr tail", () => {
 });
 
 describe("child lifecycle projection", () => {
+	const host = (phase: string, version = 1) => ({ type: CHILD_HOST_LIFECYCLE_EVENT, version, phase });
+
+	it("waits for print teardown through compaction callbacks and continuation preflight", () => {
+		const lifecycle = createChildLifecycle();
+		assert.equal(lifecycle.project(host("ready")), "cancel-drain");
+		for (const event of [
+			{ type: "agent_start" }, { type: "message_end" }, { type: "agent_settled" },
+			{ type: "compaction_start" }, { type: "agent_settled" }, { type: "compaction_end" },
+			{ type: "agent_start" }, { type: "message_end" }, { type: "agent_settled" },
+		]) {
+			assert.equal(lifecycle.project(event, event.type === "message_end"), "none");
+			assert.equal(lifecycle.canDrain(), false, event.type);
+		}
+		assert.equal(lifecycle.project(host("shutdown")), "start-drain");
+		assert.equal(lifecycle.canDrain(), true);
+	});
+
+	it("cleans up final compaction without requiring a continuation or new settlement", () => {
+		const lifecycle = createChildLifecycle();
+		lifecycle.project(host("ready"));
+		lifecycle.project({ type: "agent_settled" });
+		lifecycle.project({ type: "compaction_start" });
+		lifecycle.project({ type: "compaction_end" });
+		assert.equal(lifecycle.canDrain(), false);
+		assert.equal(lifecycle.project(host("shutdown")), "start-drain");
+		assert.equal(lifecycle.canDrain(), true);
+	});
+
+	it("ignores unnegotiated/unknown host markers and cancels legacy cleanup on ready", () => {
+		const lifecycle = createChildLifecycle();
+		assert.equal(lifecycle.project(host("shutdown")), "none");
+		assert.equal(lifecycle.project(host("ready", 2)), "none");
+		assert.equal(lifecycle.project({ type: "agent_settled" }), "start-drain");
+		assert.equal(lifecycle.project(host("ready")), "cancel-drain");
+		assert.equal(lifecycle.canDrain(), false);
+		assert.equal(lifecycle.project(host("unknown")), "none");
+		lifecycle.project(host("shutdown"));
+		assert.equal(lifecycle.project(host("ready")), "cancel-drain");
+		assert.equal(lifecycle.canDrain(), false);
+	});
+
+	it("parses only exact lifecycle records on the diagnostic channel", () => {
+		assert.deepEqual(parseChildHostLifecycle(JSON.stringify(host("ready"))), host("ready"));
+		assert.deepEqual(parseChildHostLifecycle(JSON.stringify(host("shutdown"))), host("shutdown"));
+		for (const line of ["ordinary diagnostic", "null", "{}", JSON.stringify(host("ready", 2)), JSON.stringify(host("unknown")), '{"type":"agent_settled"}']) {
+			assert.equal(parseChildHostLifecycle(line), undefined, line);
+		}
+	});
+
 	for (const settledFirst of [true, false]) {
 		it(`defers compaction cleanup with settledFirst=${settledFirst}`, () => {
 			const lifecycle = createChildLifecycle();

@@ -80,7 +80,7 @@ import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudget
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
-import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, createChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
+import { parseChildHostLifecycle, createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, createChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import {
 	acceptChildWatchdogEvent,
 	childWatchdogIsActive,
@@ -919,7 +919,11 @@ async function runSingleAttempt(
 		const stderrReader = createBoundedLineReader({
 			stream: "stderr",
 			maxPendingLineBytes: MAX_CHILD_STDERR_BYTES,
-			onLine: (line) => shared.transcriptWriter?.writeStderrLine(line),
+			onLine: (line) => {
+				const event = parseChildHostLifecycle(line);
+				if (event) applyChildLifecycle(childLifecycle.project(event));
+				shared.transcriptWriter?.writeStderrLine(line);
+			},
 			onLimit: (limit) => shared.transcriptWriter?.writeStderrLine(formatProtocolOutputLimit(limit)),
 		});
 

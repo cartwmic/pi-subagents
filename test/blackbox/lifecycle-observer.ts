@@ -1,4 +1,5 @@
-// Observation only: no compaction, continuation, or provider substitution.
+// Observe lifecycle and optionally retain stdio/teardown for cleanup tests.
+// No compaction, continuation, or provider substitution.
 import { appendFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -25,6 +26,13 @@ export default function (pi: ExtensionAPI): void {
 				...(type === "session_start" ? { argv: process.argv, pid: process.pid, sessionFile: ctx.sessionManager.getSessionFile() } : {}),
 				...("reason" in event ? { reason: event.reason } : {}),
 			}) + "\n");
+		});
+	}
+	if (process.env.HEADLESS_COMPACTION_PROOF_SHUTDOWN_LINGER === "1") {
+		pi.on("session_shutdown", () => {
+			// Exercise both terminal cleanup stages after real final compaction.
+			process.on("SIGTERM", () => {});
+			return new Promise<void>(() => { setInterval(() => {}, 1000); });
 		});
 	}
 }

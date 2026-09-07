@@ -23,8 +23,10 @@ def main():
     parser.add_argument('--pi', default=shutil.which('pi'))
     parser.add_argument('--extension', type=Path, default=Path.home() / '.pi/agent/extensions/auto-compact/index.ts')
     parser.add_argument('--mode', choices=['foreground', 'background'], default='background')
-    parser.add_argument('--scenario', choices=['inter-turn', 'final-turn', 'resume-error', 'summary-error', 'timeout', 'stop', 'linger'], default='inter-turn')
+    parser.add_argument('--scenario', choices=['inter-turn', 'final-turn', 'resume-error', 'summary-error', 'timeout', 'stop', 'linger', 'delayed-start', 'timeout-start', 'stop-start', 'shutdown-linger'], default='inter-turn')
+    parser.add_argument('--start-delay-ms', type=int, default=0, help='Delay real extension continuation input preflight')
     args = parser.parse_args()
+    start_delay_ms = max(args.start_delay_ms, 12000 if args.scenario in ('timeout-start', 'stop-start') else 2500 if args.scenario == 'delayed-start' else 0)
     root = args.artifacts.resolve()
     assert not root.is_relative_to(REPO), 'Captures must stay outside git'
     root.mkdir(parents=True, exist_ok=False)
@@ -37,7 +39,7 @@ name: probe
 description: Local compaction fixture
 tools: read, write
 model: proof/scripted
-subagentOnlyExtensions: {REPO / 'test/blackbox/lifecycle-observer.ts'}
+subagentOnlyExtensions: {REPO / 'test/blackbox/lifecycle-observer.ts'}, {REPO / 'test/blackbox/delayed-continuation.ts'}
 completionGuard: false
 ---
 Follow the scripted task.
@@ -82,7 +84,7 @@ Follow the scripted task.
                               'model': 'proof/scripted', 'context': 'fresh', 'agentScope': 'project',
                               'async': args.mode == 'background', 'clarify': False, 'acceptance': False,
                               'timeoutMs': 60000}
-                    if args.scenario == 'timeout':
+                    if args.scenario in ('timeout', 'timeout-start'):
                         params['timeoutMs'] = 7000
                     delta = call('subagent', params)
                 elif args.mode == 'background' and len(results) == 1:
@@ -90,7 +92,11 @@ Follow the scripted task.
                     import re
                     text = str(results[-1]['content'])
                     match = re.search(r'\b[a-f0-9]{8}(?:-[a-f0-9-]+)?\b', text)
-                    if args.scenario == 'stop':
+                    if args.scenario in ('stop', 'stop-start'):
+                        if args.scenario == 'stop-start':
+                            deadline = time.monotonic() + 20
+                            while not (root / 'continuation-preflight.jsonl').exists() and time.monotonic() < deadline:
+                                time.sleep(0.05)
                         time.sleep(1)
                         if not match:
                             errors.append('No async id for stop')
@@ -106,7 +112,7 @@ Follow the scripted task.
                 else:
                     # Let the host observe detached-runner close before print
                     # disposal; stop acknowledges control before process exit.
-                    if args.scenario == 'stop':
+                    if args.scenario in ('stop', 'stop-start'):
                         time.sleep(1)
                     delta = {'content': 'PARENT_DONE'}
             elif summary:
@@ -122,7 +128,7 @@ Follow the scripted task.
                     delta['content'] = 'Retained historical context. ' * 3500
                 elif normal_calls == 2:
                     usage = 120515
-                    if args.scenario == 'final-turn':
+                    if args.scenario in ('final-turn', 'shutdown-linger'):
                         usage = 123000
                         delta = {'content': 'PROOF_DONE'}
                     else:
@@ -171,13 +177,16 @@ Follow the scripted task.
     env = {k: v for k, v in os.environ.items() if not k.startswith(('PI_SUBAGENT', 'PI_INTERCOM'))}
     env.update(PI_CODING_AGENT_DIR=str(agent), PI_OFFLINE='1', PI_TELEMETRY='0',
                TMPDIR=str(root / 'tmp'), HEADLESS_COMPACTION_PROOF_DIR=str(root),
-               HEADLESS_COMPACTION_PROOF_LINGER='1' if args.scenario == 'linger' else '0')
+               HEADLESS_COMPACTION_PROOF_LINGER='1' if args.scenario == 'linger' else '0',
+               HEADLESS_COMPACTION_PROOF_START_DELAY_MS=str(start_delay_ms),
+               HEADLESS_COMPACTION_PROOF_SHUTDOWN_LINGER='1' if args.scenario == 'shutdown-linger' else '0')
     (root / 'tmp').mkdir()
     holder_alive_after_result = False
     try:
         result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True, timeout=90)
         (root / 'stdout.jsonl').write_text(result.stdout)
         (root / 'stderr').write_text(result.stderr)
+        parent_finished_at = time.time() * 1000
     finally:
         server.shutdown()
         holder_path = root / 'stdio-holder.json'
@@ -225,11 +234,11 @@ Follow the scripted task.
     compactions = [e for e in entries if e.get('type') == 'compaction']
     child_lifecycle_path = root / 'child-lifecycle.jsonl'
     child_lifecycle = [json.loads(line) for line in child_lifecycle_path.read_text().splitlines()] if child_lifecycle_path.exists() else []
-    if not child_lifecycle or (args.scenario not in ('timeout', 'stop') and child_lifecycle[-1]['type'] != 'session_shutdown'):
+    if not child_lifecycle or (args.scenario not in ('timeout', 'stop', 'timeout-start', 'stop-start') and child_lifecycle[-1]['type'] != 'session_shutdown'):
         errors.append('Missing observed child shutdown')
     if len(sessions) != 1:
         errors.append('Expected exactly one native child session')
-    failed_scenario = args.scenario in ('resume-error', 'timeout', 'stop')
+    failed_scenario = args.scenario in ('resume-error', 'timeout', 'stop', 'timeout-start', 'stop-start')
     if result.returncode != 0 or not any(e.get('message', {}).get('content') == [{'type': 'text', 'text': 'PARENT_DONE'}] for e in events):
         errors.append('Parent public tool workflow did not complete')
     if not tool_results or any(m.get('isError') for m in tool_results) and not failed_scenario:
@@ -240,12 +249,12 @@ Follow the scripted task.
         # Delivered background results are consumed by the host's watcher.
         # For stop, its persisted failed step plus the actual completion
         # notification prove delivery even after that transient file is gone.
-        if args.scenario == 'stop' and not payloads and statuses:
+        if args.scenario in ('stop', 'stop-start') and not payloads and statuses:
             child_results = statuses[0].get('steps', [])
             notifications = [e.get('message', {}) for e in events if e.get('type') == 'message_end' and e.get('message', {}).get('customType') == 'subagent-notify']
             if not any('Subagent stopped by user.' in str(m.get('content')) for m in notifications):
                 errors.append('Stopped result was not delivered')
-        if (len(payloads) != 1 and args.scenario != 'stop') or len(statuses) != 1 or statuses[0].get('state') not in ('complete', 'failed', 'stopped'):
+        if (len(payloads) != 1 and args.scenario not in ('stop', 'stop-start')) or len(statuses) != 1 or statuses[0].get('state') not in ('complete', 'failed', 'stopped'):
             errors.append('Missing terminal native background status/result')
         if not list(root.rglob('process-terminal.json')):
             errors.append('Missing native process-terminal receipt')
@@ -256,7 +265,7 @@ Follow the scripted task.
     if not child_results:
         errors.append('No native child result')
     elif failed_scenario:
-        expected = 'SCRIPTED_FAILURE' if args.scenario == 'resume-error' else ('timed out' if args.scenario == 'timeout' else 'stopped')
+        expected = 'SCRIPTED_FAILURE' if args.scenario == 'resume-error' else ('timed out' if args.scenario in ('timeout', 'timeout-start') else 'stopped')
         if child_exit in (0, None) or expected.lower() not in json.dumps(child_results).lower():
             errors.append('Genuine child failure was suppressed: ' + expected)
     elif child_exit != 0 or child_results[0].get('output', child_results[0].get('finalOutput')) != 'PROOF_DONE':
@@ -274,7 +283,7 @@ Follow the scripted task.
         expected_compactions = 0 if args.scenario == 'summary-error' else 1
         if len(compactions) != expected_compactions:
             errors.append(f'Expected {expected_compactions} saved native compactions, got {len(compactions)}')
-    if args.scenario in ('inter-turn', 'summary-error', 'linger'):
+    if args.scenario in ('inter-turn', 'summary-error', 'linger', 'delayed-start'):
         marker = work / 'post-compaction.txt'
         if not marker.exists() or marker.read_text() != 'POST_COMPACTION_ACTION':
             errors.append('Missing real post-compaction write')
@@ -284,9 +293,23 @@ Follow the scripted task.
             errors.append('Native session lacks retained continuation followed by completed write')
         elif compactions and entries.index(compactions[0]) >= continuation[0]:
             errors.append('Continuation preceded saved compaction')
-    if args.scenario == 'final-turn' and (normal_calls != 2 or (work / 'post-compaction.txt').exists()):
+    if args.scenario in ('final-turn', 'shutdown-linger') and (normal_calls != 2 or (work / 'post-compaction.txt').exists()):
         errors.append('Final-turn compaction resumed spurious work')
-    receipt = {'mode': args.mode, 'scenario': args.scenario, 'exit': result.returncode, 'compactions': len(compactions),
+    if args.scenario == 'shutdown-linger':
+        shutdown_at = next((e['at'] for e in child_lifecycle if e['type'] == 'session_shutdown'), None)
+        if shutdown_at is None or not 3500 <= parent_finished_at - shutdown_at < 12000:
+            errors.append('Lingering shutdown did not exercise bounded SIGTERM/SIGKILL cleanup')
+    if start_delay_ms > 0:
+        preflight_path = root / 'continuation-preflight.jsonl'
+        preflight = [json.loads(line) for line in preflight_path.read_text().splitlines()] if preflight_path.exists() else []
+        compact_end = next((e['at'] for e in child_lifecycle if e['type'] in ('session_compact', 'session_compact_failed')), None)
+        starts = [e['at'] for e in child_lifecycle if e['type'] == 'agent_start' and compact_end is not None and e['at'] > compact_end]
+        if args.scenario in ('timeout-start', 'stop-start'):
+            if len(compactions) != 1 or len(preflight) != 1 or starts or (work / 'post-compaction.txt').exists():
+                errors.append('Explicit cancellation did not stop pending post-compaction input')
+        elif len(preflight) != 2 or preflight[-1]['at'] - preflight[0]['at'] < start_delay_ms - 100 or not starts or starts[0] < preflight[-1]['at']:
+            errors.append('Delayed post-compaction input did not finish before genuine continuation agent_start')
+    receipt = {'mode': args.mode, 'scenario': args.scenario, 'start_delay_ms': start_delay_ms, 'exit': result.returncode, 'compactions': len(compactions),
                'normal_requests': normal_calls, 'summary_requests': summary_calls, 'errors': errors,
                'artifacts': str(root), 'sessions': [str(p) for p in sessions]}
     (root / 'receipt.json').write_text(json.dumps(receipt, indent=2))

@@ -104,7 +104,7 @@ import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudget
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup } from "../shared/parallel-handoff.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
-import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, createChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
+import { parseChildHostLifecycle, createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, createChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
 import { decodeSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import {
@@ -642,7 +642,11 @@ function runPiStreaming(
 		const stderrReader = createBoundedLineReader({
 			stream: "stderr",
 			maxPendingLineBytes: MAX_CHILD_STDERR_BYTES,
-			onLine: (line) => appendChildLine("subagent.child.stderr", line),
+			onLine: (line) => {
+				const event = parseChildHostLifecycle(line);
+				if (event) applyChildLifecycle(childLifecycle.project(event));
+				appendChildLine("subagent.child.stderr", line);
+			},
 			onLimit: (limit) => appendChildLine("subagent.child.stderr", formatProtocolOutputLimit(limit)),
 		});
 		const clearStdioGuard = attachPostExitStdioGuard(child, { idleMs: 2000, hardMs: 8000 });

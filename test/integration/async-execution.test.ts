@@ -646,6 +646,25 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		});
 	}
 
+	for (const resume of [true, false]) {
+		it(`waits for host teardown with ${resume ? "delayed preflight" : "final compaction"}`, { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			mockPi.onCall({ steps: [
+				{ stderr: '{"type":"subagent_host_lifecycle","version":1,"phase":"ready"}\n' },
+				{ jsonl: [events.assistantMessage("before compaction"), { type: "agent_settled" }, { type: "compaction_start" }, { type: "compaction_end" }] },
+				{ delay: 1400, jsonl: resume ? [{ type: "agent_start" }, events.assistantMessage("after compaction"), { type: "agent_settled" }] : [] },
+				{ delay: 1400, stderr: '{"type":"subagent_host_lifecycle","version":1,"phase":"shutdown"}\n' },
+			], keepAliveAfterFinalMessageMs: 10000 });
+			const startedAt = Date.now();
+			const id = `async-host-drain-${resume}-${Date.now().toString(36)}`;
+			launchProtocolTest(id);
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, true);
+			assert.equal(payload.results[0]?.output, resume ? "after compaction" : "before compaction");
+			assert.ok(Date.now() - startedAt >= 3600, "must wait through preflight and host teardown");
+			assert.ok(Date.now() - startedAt < 9000, "must bound lingering process cleanup");
+		});
+	}
+
 	it("background treats agent_settled as a clean terminal watermark", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ jsonl: [mockAssistantMessage("settled async without a terminal assistant stop", "tool_use"), { type: "agent_settled" }], keepAliveAfterFinalMessageMs: 5000 });
 		const id = `async-lifecycle-settled-${Date.now().toString(36)}`;
