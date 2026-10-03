@@ -6,6 +6,7 @@ async function childWithHost(waitForExtensionTasks?: () => Promise<void>) {
 	const calls: string[] = [];
 	// SAFETY: this scripted SDK implements the exact factory operations exercised
 	// below; no model, tools, provider registrations or external I/O are requested.
+	// oxlint-disable-next-line anti-slop/no-chained-type-assertions -- Deliberately partial SDK test double.
 	const pi = {
 		ModelRuntime: { create: async () => ({}) },
 		SettingsManager: { create: () => ({ getTheme: () => ({}) }) },
@@ -15,7 +16,7 @@ async function childWithHost(waitForExtensionTasks?: () => Promise<void>) {
 			bindExtensions: async () => {},
 			prompt: async () => { calls.push("prompt"); },
 			dispose: () => { calls.push("dispose"); },
-			...(waitForExtensionTasks ? { waitForExtensionTasks } : {}),
+			waitForExtensionTasks,
 		} }),
 	} as unknown as PiCodingAgentModule;
 	const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });

@@ -578,6 +578,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
 				prompt: async (text) => {
+					// oxlint-disable-next-line anti-slop/no-runtime-typeof -- Optional SDK capability, not unparsed input.
 					if (typeof extensionHost.waitForExtensionTasks !== "function") return session.prompt(text);
 					await session.prompt(text);
 					extensionDrains.add(child);
