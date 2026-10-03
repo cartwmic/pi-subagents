@@ -1008,7 +1008,9 @@ async function runSingleAttempt(
 				}
 			}
 			const lifecycleAction = projectChildLifecycle(evt, false, childLifecycleState);
-			if (evt.type === "agent_settled" && lifecycleAction === "start-drain") {
+			// Settlement still informs abort diagnostics during manual compaction;
+			// only retry settlement is provisional. Drain ownership is separate.
+			if (evt.type === "agent_settled" && !childLifecycleState.compactionRetryActive) {
 				agentSettledReceived = true;
 				afterCompactionSettlement = compactionStartedReceived;
 			}

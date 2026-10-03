@@ -431,7 +431,9 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				afterCompactionSettlement = false;
 			}
 			const lifecycleAction = projectChildLifecycle(event, false, childLifecycleState);
-			if (event.type === "agent_settled" && lifecycleAction === "start-drain") {
+			// Settlement still informs abort diagnostics during manual compaction;
+			// only retry settlement is provisional. Drain ownership is separate.
+			if (event.type === "agent_settled" && !childLifecycleState.compactionRetryActive) {
 				agentSettledReceived = true;
 				afterCompactionSettlement = compactionStartedReceived;
 			}
