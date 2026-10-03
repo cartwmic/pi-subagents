@@ -126,6 +126,14 @@ export interface ChildSession {
 	shutDown?: boolean;
 }
 
+// SDK hosts with extension-task ownership must keep the final-drain fallback
+// from aborting compaction callbacks and asynchronous continuation preflight.
+const extensionDrains = new WeakSet<ChildSession>();
+
+export function childSessionExtensionDrainHeld(session: ChildSession | undefined): boolean {
+	return session !== undefined && extensionDrains.has(session);
+}
+
 export function childSessionHasQueuedMessages(session: ChildSession | undefined): boolean {
 	try {
 		return session?.hasQueuedMessages?.() === true;
@@ -564,9 +572,21 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				mcpWaits.add(ready);
 				try { await ready; } finally { mcpWaits.delete(ready); }
 			}
+			// SAFETY: this optional host capability is detected before invocation;
+			// unpatched SDKs retain their ordinary prompt-settlement boundary.
+			const extensionHost = session as typeof session & { waitForExtensionTasks?: () => Promise<void> };
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
-				prompt: (text) => session.prompt(text),
+				prompt: async (text) => {
+					if (typeof extensionHost.waitForExtensionTasks !== "function") return session.prompt(text);
+					await session.prompt(text);
+					extensionDrains.add(child);
+					try {
+						await extensionHost.waitForExtensionTasks();
+					} finally {
+						extensionDrains.delete(child);
+					}
+				},
 				...(commands ? { finishCommands: () => commands.finish() } : {}),
 				steer: (text) => session.steer(text),
 				followUp: (text) => session.followUp(text),

@@ -103,7 +103,7 @@ import {
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
-import { childSessionFactory, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
+import { childSessionFactory, childSessionExtensionDrainHeld, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
@@ -678,6 +678,7 @@ async function runSingleAttempt(
 			return queuedDrainHold;
 		};
 		const startFinalDrain = () => {
+			if (childLifecycleState.compactionActive || childSessionExtensionDrainHeld(session)) return;
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
@@ -690,7 +691,7 @@ async function runSingleAttempt(
 			if (sessionSettled || finalDrainTimer || lifecycleFinished) return;
 			finalDrainTimer = setTimeout(() => {
 				if (lifecycleFinished || sessionSettled) return;
-				if (capture.finalDrainHeld() || observeQueuedDrainHold()) {
+				if (childSessionExtensionDrainHeld(session) || capture.finalDrainHeld() || observeQueuedDrainHold()) {
 					finalDrainTimer = undefined;
 					armFinalDrainTimer();
 					return;

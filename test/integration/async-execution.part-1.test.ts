@@ -1322,7 +1322,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 	it("does not report successful compaction settlement as a failure", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
-			jsonl: [{ type: "compaction_start" }, mockAssistantMessage("settled after compaction"), { type: "agent_settled" }],
+			// A completed compaction must end before the resumed run settles.
+			jsonl: [{ type: "compaction_start" }, { type: "compaction_end", willRetry: false }, mockAssistantMessage("settled after compaction"), { type: "agent_settled" }],
 			keepAliveAfterFinalMessageMs: 15_000,
 		});
 		const id = `async-lifecycle-compaction-success-${Date.now().toString(36)}`;

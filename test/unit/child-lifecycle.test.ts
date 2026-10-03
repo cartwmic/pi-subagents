@@ -3,6 +3,28 @@ import { describe, it } from "node:test";
 import { projectChildLifecycle, type ChildLifecycleState } from "../../src/runs/shared/child-lifecycle.ts";
 
 describe("child lifecycle final drain", () => {
+	for (const settledFirst of [true, false]) {
+		it(`defers manual compaction cleanup with settledFirst=${settledFirst}`, () => {
+			const state: ChildLifecycleState = { compactionRetryActive: false };
+			assert.equal(projectChildLifecycle({ type: "message_end" }, true, state), "start-drain");
+			if (settledFirst) projectChildLifecycle({ type: "agent_settled" }, false, state);
+			assert.equal(projectChildLifecycle({ type: "compaction_start" }, false, state), "cancel-drain");
+			assert.equal(state.compactionActive, true);
+			assert.equal(projectChildLifecycle({ type: "agent_settled" }, false, state), "none");
+			assert.equal(projectChildLifecycle({ type: "compaction_end" }, false, state), "start-drain");
+			assert.equal(state.compactionActive, false);
+			assert.equal(projectChildLifecycle({ type: "agent_start" }, false, state), "cancel-drain");
+			assert.equal(state.terminalObserved, false);
+			assert.equal(projectChildLifecycle({ type: "message_end" }, true, state), "start-drain");
+		});
+	}
+
+	it("does not turn between-turn compaction into terminal cleanup", () => {
+		const state: ChildLifecycleState = { compactionRetryActive: false };
+		assert.equal(projectChildLifecycle({ type: "compaction_start" }, false, state), "cancel-drain");
+		assert.equal(projectChildLifecycle({ type: "compaction_end" }, false, state), "none");
+	});
+
 	for (const type of ["turn_start", "agent_start", "auto_retry_start"]) {
 		it(`cancels the previous final drain when resumed work emits ${type}`, () => {
 			const state: ChildLifecycleState = { compactionRetryActive: false };

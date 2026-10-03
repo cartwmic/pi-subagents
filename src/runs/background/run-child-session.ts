@@ -24,7 +24,7 @@ import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } f
 import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
-import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
+import { childSessionExtensionDrainHeld, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
@@ -318,6 +318,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			return queuedDrainHold;
 		};
 		function startFinalDrain(): void {
+			if (childLifecycleState.compactionActive || childSessionExtensionDrainHeld(session)) return;
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
@@ -330,7 +331,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (promptSettled || finalDrainTimer || settled) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled || promptSettled) return;
-				if (input.launch.capture.finalDrainHeld() || observeQueuedDrainHold()) {
+				if (childSessionExtensionDrainHeld(session) || input.launch.capture.finalDrainHeld() || observeQueuedDrainHold()) {
 					finalDrainTimer = undefined;
 					armFinalDrainTimer();
 					return;
