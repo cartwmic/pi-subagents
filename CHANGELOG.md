@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Background subagents failed to start on Pi 1.2.0 with "does not provide @earendil-works/chord, @earendil-works/chord/context". Chord is now required only when the host package declares it. Cherry-picked from upstream ([#2855](https://github.com/nicobailon/pi-subagents/pull/2855)).
+
 ## [0.75.0] - 2026-10-02
 
 ### Highlights
